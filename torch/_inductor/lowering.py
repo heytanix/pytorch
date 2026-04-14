@@ -4423,7 +4423,6 @@ def full(size, fill_value, **kwargs):
 
 @register_lowering(aten._efficientzerotensor)
 def _efficientzerotensor(size, **kwargs):
-    kwargs.setdefault("dtype", torch.get_default_dtype())
     return tensor_constructor(0)(size, **kwargs)
 
 
