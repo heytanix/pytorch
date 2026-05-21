@@ -51,6 +51,7 @@ from .user_defined import UserDefinedObjectVariable
 
 
 if TYPE_CHECKING:
+    from torch._dynamo.codegen import PyCodegen
     from torch._dynamo.symbolic_convert import InstructionTranslatorBase
 
 
@@ -107,6 +108,7 @@ class OptimizerVariable(UserDefinedObjectVariable):
         self.grad_to_source = grad_to_source or {}
         self.tensor_to_source = tensor_to_source or {}
         self.static_tensor_names = static_tensor_names or set()
+        self._saved_capturables: dict[int, bool] | None = None
 
     def call_method(
         self,
@@ -195,8 +197,6 @@ class OptimizerVariable(UserDefinedObjectVariable):
     def _set_capturable(self, tx: "InstructionTranslatorBase") -> None:
         from . import LazyVariableTracker
 
-        # We only set capturable if params are on cuda
-        # and the state is not initialized
         def safe_to_set_capturable(group: dict[str, Any]) -> bool:
             all_uninitialized = True
             all_gpu = True
@@ -207,20 +207,33 @@ class OptimizerVariable(UserDefinedObjectVariable):
 
             return "capturable" in group and all_uninitialized and all_gpu
 
-        # track indices to not set so we don't need to
-        # in the variable tracker realize the whole state
-        # we handle guarding the state specially
-        for group in self.value.param_groups:
+        if self._saved_capturables is None:
+            self._saved_capturables = {}
+            tx.output.add_cleanup_hook(self._restore_capturables)
+
+        for i, group in enumerate(self.value.param_groups):
             if safe_to_set_capturable(group):
+                self._saved_capturables[i] = group["capturable"]
                 group["capturable"] = True
 
         source = self.source and AttrSource(self.source, "param_groups")
         param_groups_vt = LazyVariableTracker.realize_all(
             VariableTracker.build(tx, self.value.param_groups, source)
         )
-        for param_group_vt in param_groups_vt.items:
+        for i, param_group_vt in enumerate(param_groups_vt.items):
             key = HashableTracker(ConstantVariable.create("capturable"))
-            param_group_vt.items[key] = ConstantVariable.create(True)
+            orig_vt = param_group_vt.items.get(key)
+            if orig_vt is None or isinstance(orig_vt, OptimizerCapturableVariable):
+                continue
+            param_group_vt.items[key] = OptimizerCapturableVariable(
+                value=True, orig_value=orig_vt.as_python_constant()
+            )
+
+    def _restore_capturables(self) -> None:
+        if self._saved_capturables is None or len(self._saved_capturables) == 0:
+            return
+        for i, val in self._saved_capturables.items():
+            self.value.param_groups[i]["capturable"] = val
 
     def get_python_args(
         self, *args: Any, **kwargs: Any
@@ -433,3 +446,24 @@ class OptimizerVariable(UserDefinedObjectVariable):
             weakref.finalize(value, clear_static_tensor_refs)
 
         tx.output.add_graph_finalizer(init_finalizer)
+
+
+class OptimizerCapturableVariable(VariableTracker):
+    """Reconstructs as the original capturable value, preventing side-effect leaks.
+    Dynamo never needs to statically evaluate 'if capturable:' itself,
+    so this VT intentionally does NOT expose as_python_constant/is_python_constant.
+    The codegen path therefore uses reconstruct() which emits the true original value.
+    """
+
+    _nonvar_fields = {"orig_value", *VariableTracker._nonvar_fields}
+
+    def __init__(self, value: bool, orig_value: bool, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.value = value
+        self.orig_value = orig_value
+
+    def python_type(self) -> type:
+        return bool
+
+    def reconstruct(self, codegen: "PyCodegen") -> None:
+        codegen(ConstantVariable.create(self.orig_value))
