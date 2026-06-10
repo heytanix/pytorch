@@ -8777,6 +8777,7 @@ def triton_kernel_wrap_(
     grid,
     tma_descriptor_metadata,
     kwargs,
+    backend_options,
 ):
     from torch._higher_order_ops.triton_kernel_wrap import kernel_side_table
 
@@ -8786,6 +8787,7 @@ def triton_kernel_wrap_(
         grid=grid,
         tma_descriptor_metadata=tma_descriptor_metadata,
         kernel_args={**kwargs, **constant_args},
+        backend_options=backend_options,
     )
     return {key: val for key, val in kwargs.items() if isinstance(val, TensorBox)}
 
