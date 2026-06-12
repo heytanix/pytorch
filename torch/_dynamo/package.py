@@ -121,13 +121,24 @@ class _GuardedCodeCacheEntry:
 
 
 def load_guards_state(guards_state: bytes) -> Any:
+    from torch._guards import tracing, TracingContext
+
     try:
         import torch.distributed.fsdp._fully_shard._fully_shard as _fully_shard
 
         ctx = _fully_shard.disable_fsdp_module_new_init()
     except ImportError:
         ctx = nullcontext()  # type: ignore[assignment]
-    with ctx:
+
+    # For runs with no active trace. Use a throwaway context and skip the install
+    if TracingContext.try_get() is not None:
+        tracing_ctx: Any = nullcontext()
+        skip_ctx: Any = nullcontext()
+    else:
+        tc = TracingContext(None)
+        tracing_ctx = tracing(tc)
+        skip_ctx = tc.guards_context.skip_guard_install()
+    with ctx, tracing_ctx, skip_ctx:
         return pickle.loads(guards_state)
 
 
