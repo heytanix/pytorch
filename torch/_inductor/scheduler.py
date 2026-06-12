@@ -9683,6 +9683,23 @@ class Scheduler:
         # Deferred to just before the first kernel that reads each input.
         V.graph.wrapper_code.register_alignment_check_inputs()
 
+        # An input read on more than one stream needs its copy_if_misaligned
+        # emitted per consuming stream (not once at the first reader by line
+        # order, which would place the only copy inside one branch's stream and
+        # race the others).  Reclassify those inputs here.
+        if self._has_multi_stream_nodes():
+            pending = V.graph.wrapper_code._pending_alignment_copies
+            if pending:
+                input_streams: dict[str, OrderedSet[int]] = {}
+                for n in nodes:
+                    s = self.node_to_stream.get(n, 0)
+                    for dep in n.read_writes.reads:
+                        if dep.name in pending:
+                            input_streams.setdefault(dep.name, OrderedSet()).add(s)
+                multi = [name for name, ss in input_streams.items() if len(ss) > 1]
+                if multi:
+                    V.graph.wrapper_code.mark_multistream_alignment(multi)
+
         for node in nodes:
             if log.isEnabledFor(logging.DEBUG):
                 try:
@@ -9747,12 +9764,12 @@ class Scheduler:
                 self.generate_stream_ctx_switching(node)
 
             # Emit deferred alignment copies for inputs first used by this
-            # node.  This runs *after* stream context switching so the copy
-            # executes on the same stream as the consuming kernel.
-            # TODO: inputs read on multiple streams should be copied in the
-            # prologue instead, to avoid cross-stream races.
+            # node, on this node's stream.  This runs *after* stream context
+            # switching so the copy executes on the same stream as the consuming
+            # kernel; inputs read on multiple streams get one copy per stream.
             V.graph.wrapper_code.codegen_deferred_alignment_copies(
-                dep.name for dep in node.read_writes.reads
+                (dep.name for dep in node.read_writes.reads),
+                self.node_to_stream.get(node, 0),
             )
 
             self.current_node = node

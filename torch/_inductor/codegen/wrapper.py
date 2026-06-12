@@ -1314,6 +1314,16 @@ class PythonWrapperCodegen(CodeGen):
         super().__init__()
         self._pending_input_asserts: dict[str, tuple[str, str]] = {}
         self._pending_alignment_copies: OrderedSet[str] = OrderedSet()
+        # Inputs read on more than one stream get a copy_if_misaligned per
+        # consuming stream (each cloning a preserved copy of the original), so
+        # every stream is ordered after its own aligned clone.  A single shared
+        # copy would leave other streams reading a clone made on -- and ordered
+        # only after -- the first reader's stream, a cross-stream race.  These
+        # track the reclassified inputs, the saved originals, and the stream
+        # each working name is currently aligned for.
+        self._multistream_alignment_copies: OrderedSet[str] = OrderedSet()
+        self._alignment_orig_saved: OrderedSet[str] = OrderedSet()
+        self._alignment_aligned_stream: dict[str, int] = {}
         self._names_iter: Iterator[int] = count()
         self.args_to_buffers: dict[
             str, None | ir.TensorBox | ir.Buffer | ir.TorchBindObject
@@ -1834,15 +1844,48 @@ class PythonWrapperCodegen(CodeGen):
                 "from torch._C._dynamo.guards import copy_if_misaligned"
             )
 
-    def codegen_deferred_alignment_copies(self, input_names: Iterable[str]) -> None:
-        """Emit alignment check + clone just before the first kernel
-        that reads each input, hiding the cost behind GPU execution."""
+    def codegen_deferred_alignment_copies(
+        self, input_names: Iterable[str], stream: int = 0
+    ) -> None:
+        """Emit alignment check + clone just before the first kernel on a given
+        stream that reads each input, hiding the cost behind GPU execution.
+
+        An input read on a single stream gets one copy at its first reader.  An
+        input read on multiple streams (see mark_multistream_alignment) instead
+        gets one copy per consuming stream, each cloning a preserved copy of the
+        original input.  That keeps the clones independent and each ordered on
+        its own stream: a single shared copy runs on -- and is ordered only
+        after -- the first reader's stream, so a consumer on another stream
+        could read it before the clone completed (a cross-stream race) or alias
+        another stream's buffer.  copy_if_misaligned never mutates its argument
+        (it returns the original or a fresh clone), so cloning the preserved
+        original from several streams concurrently is safe."""
         if V.graph.cpp_wrapper:
             return
         for name in input_names:
             if name in self._pending_alignment_copies:
                 self._pending_alignment_copies.discard(name)
                 self.writeline(f"{name} = copy_if_misaligned({name})")
+            elif name in self._multistream_alignment_copies:
+                if self._alignment_aligned_stream.get(name) == stream:
+                    continue
+                if name not in self._alignment_orig_saved:
+                    # Preserve the original (still un-rewritten here) so every
+                    # stream clones from it, not from another stream's clone.
+                    self._alignment_orig_saved.add(name)
+                    self.writeline(f"{name}_orig = {name}")
+                self.writeline(f"{name} = copy_if_misaligned({name}_orig)")
+                self._alignment_aligned_stream[name] = stream
+
+    def mark_multistream_alignment(self, names: Iterable[str]) -> None:
+        """Reclassify inputs read on more than one stream so their alignment
+        copy is emitted per consuming stream (see codegen_deferred_alignment_copies)
+        rather than once at the first reader by line order -- which would place
+        the only copy inside one branch's stream and race the other branches."""
+        for name in names:
+            if name in self._pending_alignment_copies:
+                self._pending_alignment_copies.discard(name)
+                self._multistream_alignment_copies.add(name)
 
     # this function (and below) takes the graph name as input so
     # that stream caching happens per graph instance. this

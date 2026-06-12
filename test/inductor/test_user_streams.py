@@ -1398,11 +1398,13 @@ with torch.cuda._DeviceGuard(0):
     default_stream = torch.cuda.current_stream()
     stream1 = get_external_object_by_index(1)
     with stream1:
-        arg0_1 = copy_if_misaligned(arg0_1)
+        arg0_1_orig = arg0_1
+        arg0_1 = copy_if_misaligned(arg0_1_orig)
         buf0 = empty_strided_cuda((1024, ), (1, ), torch.float32)
         raw_stream = get_raw_stream(0)
         triton_kernel.run(arg0_1, buf0, 1024, stream=raw_stream)
     with default_stream:
+        arg0_1 = copy_if_misaligned(arg0_1_orig)
         buf3 = empty_strided_cuda((1024, ), (1, ), torch.float32)
         raw_stream0 = get_raw_stream(0)
         triton_kernel.run(arg0_1, buf0, buf3, 1024, stream=raw_stream0)
@@ -1664,6 +1666,151 @@ class GraphModule(torch.nn.Module):
 # CHECK: synchronize_stream
 # CHECK: synchronize_stream""",
             wrapper_body,
+        )
+
+    def test_codegen_per_stream_alignment_copy_multi_stream(self):
+        """Regression test for per-stream alignment fixups read by many streams.
+
+        When an input is read on more than one stream, its
+        ``x = copy_if_misaligned(x)`` rewrite must be emitted once per consuming
+        stream, each cloning a preserved copy of the original input, so every
+        stream is ordered after its own aligned clone.  A single shared copy
+        (at the first reader, or hoisted to the prologue) leaves the other
+        streams reading a clone made on -- and ordered only after -- another
+        stream, a cross-stream race.
+
+        Here ``x`` is read on both ``s1`` and ``s2`` (``w1`` only on ``s1``,
+        ``w2`` only on ``s2``), so ``x`` must get two copies, one inside each
+        side-stream context, both cloning the same preserved original.
+        """
+        from torch._inductor.utils import run_and_get_code
+
+        def fn(x, w1, w2):
+            s1 = torch.cuda.Stream()
+            s2 = torch.cuda.Stream()
+            e1 = torch.cuda.Event()
+            e2 = torch.cuda.Event()
+            with torch.cuda.stream(s1):
+                a = x @ w1
+                e1.record(s1)
+            with torch.cuda.stream(s2):
+                b = x @ w2
+                e2.record(s2)
+            e1.wait()
+            e2.wait()
+            c = a + b
+            s1.synchronize()
+            s2.synchronize()
+            return c
+
+        x = torch.randn(32, 32, device="cuda")
+        w1 = torch.randn(32, 32, device="cuda")
+        w2 = torch.randn(32, 32, device="cuda")
+        expected = fn(x, w1, w2)
+        compiled_fn = torch.compile(fn)
+        result, (code,) = run_and_get_code(compiled_fn, x, w1, w2)
+        self.assertEqual(result, expected)
+
+        wrapper_body = _extract_wrapper_body(code)
+        lines = wrapper_body.split("\n")
+
+        def _first_index(predicate):
+            for idx, line in enumerate(lines):
+                if predicate(line):
+                    return idx
+            return None
+
+        first_side_stream = _first_index(lambda l: l.strip().startswith("with stream"))
+        self.assertIsNotNone(
+            first_side_stream,
+            f"no side-stream context in wrapper:\n{wrapper_body}",
+        )
+
+        # The multi-stream input is cloned once per consuming stream, each
+        # reading a preserved copy of the original (its `<name>_orig`).
+        orig_copies = [
+            (idx, l)
+            for idx, l in enumerate(lines)
+            if "copy_if_misaligned(" in l and "_orig)" in l
+        ]
+        self.assertEqual(
+            len(orig_copies),
+            2,
+            "an input read on two streams should get one per-stream copy each "
+            f"(reading a preserved original); got:\n{wrapper_body}",
+        )
+        # All per-stream copies clone the same preserved original.
+        srcs = {l.split("copy_if_misaligned(")[1].split(")")[0] for _, l in orig_copies}
+        self.assertEqual(
+            len(srcs), 1, f"per-stream copies disagree on source:\n{wrapper_body}"
+        )
+        # Each per-stream copy lands inside a side-stream context (i.e. it is
+        # NOT hoisted before the fork).
+        self.assertGreater(
+            orig_copies[0][0],
+            first_side_stream,
+            "per-stream alignment copies must be inside their stream contexts, "
+            f"not hoisted before the first fork; got:\n{wrapper_body}",
+        )
+
+    def test_codegen_per_stream_alignment_copy_one_per_stream(self):
+        """An input read multiple times on one stream gets a single copy there.
+
+        The per-stream alignment copy should be keyed on the consuming stream,
+        not on each use, so an input used several times within one
+        ``torch.cuda.stream`` block is cloned once per block.
+
+        Here ``x`` is read once on ``s1`` and twice on ``s2``, and we verify
+        that there are exactly two ``copy_if_misaligned`` clones of the
+        preserved original (one per stream), not three.
+        """
+        from torch._inductor.utils import run_and_get_code
+
+        def fn(x, w1, w2, w3):
+            s1 = torch.cuda.Stream()
+            s2 = torch.cuda.Stream()
+            e1 = torch.cuda.Event()
+            e2 = torch.cuda.Event()
+            with torch.cuda.stream(s1):
+                a = x @ w1
+                e1.record(s1)
+            with torch.cuda.stream(s2):
+                b = x @ w2
+                c = x @ w3
+                e2.record(s2)
+            e1.wait()
+            e2.wait()
+            out = a + b + c
+            s1.synchronize()
+            s2.synchronize()
+            return out
+
+        x = torch.randn(32, 32, device="cuda")
+        w1 = torch.randn(32, 32, device="cuda")
+        w2 = torch.randn(32, 32, device="cuda")
+        w3 = torch.randn(32, 32, device="cuda")
+        expected = fn(x, w1, w2, w3)
+        compiled_fn = torch.compile(fn)
+        result, (code,) = run_and_get_code(compiled_fn, x, w1, w2, w3)
+        self.assertEqual(result, expected)
+
+        wrapper_body = _extract_wrapper_body(code)
+        lines = wrapper_body.split("\n")
+
+        # x is read 3 times (once on s1, twice on s2) but must be cloned only
+        # once per consuming stream -> exactly two clones of the preserved
+        # original, not one per use.
+        orig_copies = [l for l in lines if "copy_if_misaligned(" in l and "_orig)" in l]
+        self.assertEqual(
+            len(orig_copies),
+            2,
+            "an input used multiple times on a stream should be cloned once per "
+            "stream, not once per use; expected 2 (one per stream), got "
+            f"{len(orig_copies)}:\n{wrapper_body}",
+        )
+        srcs = {l.split("copy_if_misaligned(")[1].split(")")[0] for l in orig_copies}
+        self.assertEqual(
+            len(srcs), 1, f"per-stream copies disagree on source:\n{wrapper_body}"
         )
 
 
