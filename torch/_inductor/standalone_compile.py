@@ -6,6 +6,7 @@ import logging
 import os
 import pickle
 import shutil
+import tempfile
 from abc import ABC, abstractmethod
 from contextlib import AbstractContextManager, nullcontext
 from typing import Any, Literal, TYPE_CHECKING
@@ -563,6 +564,133 @@ def standalone_compile(
             )
 
     return CacheCompiledArtifact(compiled_fn, artifacts)
+
+
+def _defines_module_level_call(src: str) -> bool:
+    """Whether ``src`` is the runnable Inductor output module (vs a kernel-only one).
+
+    The module-level ``call`` entry point is codegen'd in two forms: when
+    ``config.graph_partition`` is on it is ``call = runner.call`` (the ``def call`` is
+    an indented ``Runner`` method); otherwise it is a top-level ``def call(args):``.
+    graph_partition defaults off in fbcode, so both forms must be recognized. The
+    column-0 ``def call(`` check stays specific to the non-partition form (the
+    partition form's method is indented and matched only by ``call = runner.call``).
+    """
+    if "call = runner.call" in src:
+        return True
+    return src.startswith("def call(") or "\ndef call(" in src
+
+
+def _extract_runnable_module(captured: list[str]) -> str:
+    """Return the single Inductor output-code module that defines the runnable
+    module-level ``call`` entry point, from the sources captured via the
+    ``GraphLowering.save_output_code`` hook during codegen.
+
+    No post-hoc stripping is needed: ``compile_to_python`` disables the benchmark
+    harness and the compile-time auto-tuning docstring at codegen time, so each
+    captured module is already just the runnable kernels plus ``call``. A standalone
+    compile of an Inductor-approved graph yields exactly one such module, whether the
+    source comes from fresh codegen or a cache-restore path (both fire the hook).
+    """
+    runnable = [s for s in captured if _defines_module_level_call(s)]
+    if len(runnable) != 1:
+        raise RuntimeError(
+            f"expected exactly one runnable Inductor output module, found "
+            f"{len(runnable)}; compile_to_python cannot inline this artifact."
+        )
+    return runnable[0]
+
+
+def _binary_cache_bytes(artifact: CompiledArtifact) -> bytes | None:
+    """Serialize the artifact to opaque cache bytes, or None if it is not
+    serializable (e.g. graphs with input mutations currently do not produce a
+    saveable aot_autograd artifact). The source still runs standalone without it."""
+    with tempfile.NamedTemporaryFile(suffix=".bin", delete=False) as tf:
+        tmp = tf.name
+    try:
+        artifact.save(path=tmp, format="binary")
+        with open(tmp, "rb") as f:
+            return f.read()
+    except Exception:
+        # Some graphs legitimately have no saveable artifact (e.g. certain
+        # input-mutating graphs); the source still runs standalone without it. Log
+        # at debug so a genuine serialization regression is not silently masked as
+        # an "uncacheable" fallback (which only shows up as a missing FxGraphCache
+        # hit on reload).
+        log.debug("standalone artifact is not serializable; no cache", exc_info=True)
+        return None
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+
+def compile_to_python(
+    gm: GraphModule,
+    example_inputs: Sequence[InputType],
+    *,
+    dynamic_shapes: DynamicShapesType = "from_example_inputs",
+    options: Any = None,
+) -> tuple[str, bytes | None]:
+    """Compile ``gm`` and return ``(inner_python, cache)`` -- the INNER half of the
+    backend contract behind ``torch.precompile``.
+
+    ``inner_python`` is the Inductor output module exposing ``call(args) -> outs``
+    for the post-AOTAutograd inner graph (dense, functionalized). It is the inductor
+    piece only: it carries NO prelude/epilogue (subclass flatten/unflatten, input-
+    mutation copy-back, output-alias regen, grad disabling). Those belong to the AOT
+    layer -- see ``torch._functorch.aot_autograd.compile_to_python``, which calls
+    this and composes AOTAutograd's codegen'd runtime wrappers around the result.
+    Callers must run ``call`` under ``torch.no_grad()`` (the kernels use out= ops).
+
+    The kernels JIT-compile from the inlined source on first call, so ``inner_python``
+    needs no cache. ``cache`` is an opaque acceleration (or ``None`` when the graph
+    is not serializable, e.g. some input-mutating graphs, or when caches are disabled
+    via ``force_disable_caches`` / ``fx_graph_cache=False``).
+
+    The source is captured directly off codegen via the process-global
+    ``GraphLowering.save_output_code`` hook, decoupled from the cache: it produces
+    valid ``inner_python`` even when no cacheable artifact exists (the ``cache`` is
+    then ``None``). Serialized vs other precompiles by the AOT-level ``_COMPILE_LOCK``
+    (see ``torch._functorch.aot_autograd.compile_to_python``); the hook is restored in
+    a ``finally`` so it does not leak to other ``save_output_code`` users.
+    """
+    from .graph import GraphLowering
+
+    # Suppress the two debug-only fragments at codegen time rather than stripping
+    # them out of the emitted source afterward (the export artifact is meant to run,
+    # not be profiled): benchmark_harness emits get_args()/benchmark_compiled_module()/
+    # __main__, and autotune_at_compile_time_emit_source prepends the no-op
+    # "Compile-time auto-tuning block" docstring. The real autotuning still runs
+    # (standalone_compile keeps triton.autotune_at_compile_time on).
+    captured: list[str] = []
+    prev_hook = GraphLowering.save_output_code
+    GraphLowering.save_output_code = staticmethod(captured.append)
+    try:
+        with (
+            torch.no_grad(),
+            config.patch(
+                {
+                    "benchmark_harness": False,
+                    "triton.autotune_at_compile_time_emit_source": False,
+                    # The C++ wrapper backend emits a C++ ``call``, not the python
+                    # ``def call(args)`` this lowering extracts and inlines, so a python
+                    # artifact cannot come from it. Pin it off regardless of the ambient
+                    # config so the captured module is always the python one.
+                    "cpp_wrapper": False,
+                }
+            ),
+        ):
+            artifact = standalone_compile(
+                gm,
+                example_inputs,
+                dynamic_shapes=dynamic_shapes,
+                options=options if options else {},
+            )
+    finally:
+        GraphLowering.save_output_code = prev_hook
+    inner_python = _extract_runnable_module(captured)
+    cache = _binary_cache_bytes(artifact)
+    return inner_python, cache
 
 
 def autograd_cache_key(
