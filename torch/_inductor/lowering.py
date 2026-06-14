@@ -8740,6 +8740,49 @@ def _infer_flex_gemm_epilogue_arg_kinds(
     return tuple(epilogue_arg_kinds)
 
 
+def _validate_flex_gemm_aux_output(
+    gemm_op: torch._ops.OpOverload,
+    epilogue_arg_placeholders: tuple[torch.fx.Node, ...],
+    aux_output: torch.fx.Node | None,
+    output_size: list[Any],
+) -> Any | None:
+    if aux_output is None:
+        return None
+    if gemm_op is not torch.ops.aten.mm.default:
+        raise NotImplementedError(
+            "FlexGEMM generic aux tuple epilogues currently support only aten.mm"
+        )
+    if epilogue_arg_placeholders:
+        raise NotImplementedError(
+            "FlexGEMM generic aux tuple epilogues do not support captured tensor reads yet"
+        )
+    aux_meta = aux_output.meta.get("val")
+    if aux_meta is None:
+        raise NotImplementedError(
+            "FlexGEMM generic aux tuple epilogues require aux output metadata"
+        )
+    aux_size = ir.convert_shape_to_inductor(aux_meta.shape)
+    if aux_size != output_size:
+        raise NotImplementedError(
+            "FlexGEMM generic aux tuple epilogues currently require the aux "
+            "output shape to match the GEMM output shape"
+        )
+    return aux_meta
+
+
+def _allocate_flex_gemm_aux_out(
+    aux_meta: Any | None, mat1: TensorBox
+) -> TensorBox | None:
+    if aux_meta is None:
+        return None
+    return empty_strided(
+        ir.convert_shape_to_inductor(aux_meta.shape),
+        ir.convert_shape_to_inductor(aux_meta.stride()),
+        dtype=aux_meta.dtype,
+        device=mat1.get_device_or_error(),
+    )
+
+
 @register_lowering(flex_gemm_hop, type_promotion_kind=None)
 def flex_gemm_lowering(gemm_op, subgraph, args, gemm_kwargs, kernel_options):
     """Lower FlexGEMM to the regular subgraph path or the QUACK template."""
@@ -8759,7 +8802,7 @@ def flex_gemm_lowering(gemm_op, subgraph, args, gemm_kwargs, kernel_options):
     from torch._inductor.kernel.flex_gemm.epilogue import (
         gemm_node as flex_gemm_node,
         materialize_flex_gemm_epilogue,
-        output_node as flex_gemm_output_node,
+        output_plan as flex_gemm_output_plan,
     )
     from torch._inductor.kernel.flex_gemm.template import (
         flex_gemm_epilogue_template,
@@ -8800,12 +8843,16 @@ def flex_gemm_lowering(gemm_op, subgraph, args, gemm_kwargs, kernel_options):
     beta = gemm_fx_node.kwargs.get("beta", gemm_kwargs.get("beta", 1.0))
     if not isinstance(alpha, (int, float)) or not isinstance(beta, (int, float)):
         raise NotImplementedError("FlexGEMM alpha/beta must be static scalars")
-    output_meta = flex_gemm_output_node(subgraph.graph_module).meta.get("val")
+    outputs = flex_gemm_output_plan(subgraph.graph_module)
+    output_meta = outputs.output.meta.get("val")
     if output_meta is None:
         raise NotImplementedError(
             "FlexGEMM generated epilogues require output metadata"
         )
     output_size = ir.convert_shape_to_inductor(output_meta.shape)
+    aux_meta = _validate_flex_gemm_aux_output(
+        gemm_op, epilogue_arg_placeholders, outputs.aux_output, output_size
+    )
     layout = ir.FixedLayout(
         gemm_args[mat1_index].get_device_or_error(),
         output_meta.dtype,
@@ -8818,7 +8865,15 @@ def flex_gemm_lowering(gemm_op, subgraph, args, gemm_kwargs, kernel_options):
     epilogue_input_nodes = [
         ir.TemplateBuffer.realize_template_input(arg) for arg in epilogue_args
     ]
-    input_nodes = [*gemm_input_nodes, *epilogue_input_nodes]
+    aux_out = _allocate_flex_gemm_aux_out(aux_meta, gemm_args[mat1_index])
+    aux_input_nodes = []
+    if aux_out is not None:
+        aux_input_nodes = [ir.TemplateBuffer.realize_template_input(aux_out)]
+    input_nodes = [*gemm_input_nodes, *epilogue_input_nodes, *aux_input_nodes]
+    mutated_inputs = aux_input_nodes or None
+    aux_out_index = (
+        len(gemm_input_nodes) + len(epilogue_input_nodes) if aux_input_nodes else None
+    )
     epilogue_arg_kinds = _infer_flex_gemm_epilogue_arg_kinds(
         gemm_op, epilogue_input_nodes, output_size
     )
@@ -8847,12 +8902,19 @@ def flex_gemm_lowering(gemm_op, subgraph, args, gemm_kwargs, kernel_options):
                 gemm_args[mat2_index].get_size()[-1],
             ),
         )
+    epilogue_arg_indices = tuple(
+        range(
+            len(gemm_input_nodes),
+            len(gemm_input_nodes) + len(epilogue_input_nodes),
+        )
+    )
     choices: list[Any] = []
     for quack_config_key in quack_config_keys:
         error = flex_gemm_epilogue_template.maybe_append_choice(
             choices,
             input_nodes=input_nodes,
             layout=layout,
+            mutated_inputs=mutated_inputs,
             config=FlexGemmEpilogueConfig(
                 epilogue_name=epilogue_name,
                 epilogue_source=epilogue_source,
@@ -8861,10 +8923,9 @@ def flex_gemm_lowering(gemm_op, subgraph, args, gemm_kwargs, kernel_options):
                 beta=float(beta),
                 out_dtype=output_meta.dtype,
                 quack_config_key=quack_config_key,
-                epilogue_arg_indices=tuple(
-                    range(len(gemm_input_nodes), len(input_nodes))
-                ),
+                epilogue_arg_indices=epilogue_arg_indices,
                 epilogue_arg_kinds=epilogue_arg_kinds,
+                aux_out_index=aux_out_index,
             ),
         )
         if error is not None:
@@ -8872,6 +8933,8 @@ def flex_gemm_lowering(gemm_op, subgraph, args, gemm_kwargs, kernel_options):
     result, _ = autotune_select_algorithm(
         "flex_gemm_epilogue", choices, input_nodes, layout
     )
+    if aux_out is not None:
+        return (result, aux_out)
     return (result,)
 
 

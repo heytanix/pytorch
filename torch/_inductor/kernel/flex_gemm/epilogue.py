@@ -1,4 +1,5 @@
 # mypy: allow-untyped-defs
+import dataclasses
 import hashlib
 from typing import Any
 
@@ -99,16 +100,40 @@ class FlexGemmCuteDSLOpOverrides(CuteDSLOpOverrides):
         return CuteDSLOpOverrides.to_dtype(x, dtype)
 
 
-def output_node(graph_module: torch.fx.GraphModule) -> torch.fx.Node:
+@dataclasses.dataclass(frozen=True)
+class FlexGemmOutputPlan:
+    """Classify the FlexGEMM body output into main and optional aux tensors."""
+
+    output: torch.fx.Node
+    aux_output: torch.fx.Node | None = None
+
+
+def output_plan(
+    graph_module: torch.fx.GraphModule,
+) -> FlexGemmOutputPlan:
     output_nodes = [node for node in graph_module.graph.nodes if node.op == "output"]
     if len(output_nodes) != 1:
         raise NotImplementedError("FlexGEMM expects one output node")
     output_value = output_nodes[0].args[0]
-    if isinstance(output_value, (tuple, list)) and len(output_value) == 1:
-        output_value = output_value[0]
+    if isinstance(output_value, (tuple, list)):
+        if len(output_value) == 1:
+            output_value = output_value[0]
+        elif len(output_value) == 2:
+            output, aux_output = output_value
+            if not isinstance(output, torch.fx.Node) or not isinstance(
+                aux_output, torch.fx.Node
+            ):
+                raise NotImplementedError(
+                    "FlexGEMM tuple epilogues expect tensor outputs"
+                )
+            return FlexGemmOutputPlan(output, aux_output)
+        else:
+            raise NotImplementedError(
+                "FlexGEMM tuple epilogues currently support only one aux output"
+            )
     if not isinstance(output_value, torch.fx.Node):
         raise NotImplementedError("FlexGEMM expects one tensor output")
-    return output_value
+    return FlexGemmOutputPlan(output_value)
 
 
 def gemm_node(
@@ -170,7 +195,7 @@ def materialize_flex_gemm_epilogue(
     epilogue_arg_placeholders: tuple[torch.fx.Node, ...] = (),
 ) -> tuple[str, str]:
     gemm = gemm_node(graph_module, gemm_op)
-    output = output_node(graph_module)
+    outputs = output_plan(graph_module)
     kernel = FlexGemmCuteDSLKernel()
     env: dict[torch.fx.Node, Any] = {
         gemm: CuteDSLCSEVariable(
@@ -205,6 +230,9 @@ def materialize_flex_gemm_epilogue(
         body += "\n"
     aux_args = [f"aux{index}" for index in range(len(epilogue_arg_placeholders))]
     epilogue_params = ", ".join(["acc", *aux_args])
+    result = _cute_arg(outputs.output, env)
+    if outputs.aux_output is not None:
+        result = f"({result}, {_cute_arg(outputs.aux_output, env)})"
     return (
         name,
         "import cutlass\n"
@@ -212,5 +240,5 @@ def materialize_flex_gemm_epilogue(
         "import operator\n"
         "from cutlass._mlir.dialects import math as mlir_math\n\n"
         f"@cute.jit\ndef {name}({epilogue_params}):\n"
-        f"{body}    return {_cute_arg(output, env)}\n",
+        f"{body}    return {result}\n",
     )
