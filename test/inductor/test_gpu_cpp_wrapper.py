@@ -6,6 +6,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from typing import NamedTuple
 
 import torch
@@ -18,6 +19,7 @@ from torch._inductor.codegen.cpp_wrapper_gpu import (
 from torch._inductor.codegen.cuda.device_op_overrides import CUDADeviceOpOverrides
 from torch._inductor.test_case import TestCase as InductorTestCase
 from torch._inductor.utils import IndentedBuffer
+from torch._inductor.virtualized import V
 from torch.testing._internal.common_utils import (
     instantiate_parametrized_tests,
     parametrize,
@@ -130,7 +132,11 @@ class TestGpuWrapper(InductorTestCase):
 
         wrapper.prefix = IndentedBuffer()
         wrapper._lazy_kernel_names = []
-        with config.patch({"triton.debug_sync_graph": True}):
+        graph = SimpleNamespace(is_dual_wrapper_mode=False)
+        with (
+            config.patch({"triton.debug_sync_graph": True}),
+            V.set_graph_handler(graph),
+        ):
             wrapper._codegen_entry_impl_prologue()
         code = wrapper.prefix.getvalue()
         self.assertIn("AOTI_RUNTIME_CUDA_CHECK", code)
