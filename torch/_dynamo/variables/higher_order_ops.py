@@ -3296,7 +3296,6 @@ class ScanHigherOrderVariable(TorchHigherOrderOperatorVariable):
 class MapHigherOrderVariable(TorchHigherOrderOperatorVariable):
     _HOP_NAME = "torch.ops.higher_order.map_impl"
     _ALLOW_FALLBACK_TO_EAGER = False
-    supports_input_mutation = False
     supports_aliasing = False
 
     def _call_function(
@@ -3305,6 +3304,11 @@ class MapHigherOrderVariable(TorchHigherOrderOperatorVariable):
         args: list[VariableTracker],
         kwargs: dict[str, VariableTracker],
     ) -> VariableTracker:
+        # Input mutation is only safe in inference: under autograd the
+        # functional rewrite of a mutating subgraph would lose the storage
+        # identity required for the backward pass.
+        self.supports_input_mutation = not torch.is_grad_enabled()
+
         args, kwargs = LazyVariableTracker.realize_all((args, kwargs))
 
         if len(kwargs) > 0:
@@ -3382,6 +3386,10 @@ class MapHigherOrderVariable(TorchHigherOrderOperatorVariable):
             supports_aliasing=self.supports_aliasing,
         )
 
+        body_mutated_inputs = set(
+            getattr(body_graph, "_dynamo_mutated_input_indices", ())
+        )
+
         # Check all outputs of map are tensors.
         # For map, outputting None is OK, thus ignore None values in the check
         body_r_vars = unpack_iterable(tx, body_r)
@@ -3389,6 +3397,55 @@ class MapHigherOrderVariable(TorchHigherOrderOperatorVariable):
         _check_all_tensorvariable(
             [br for bm, br in zip(none_mask, body_r_vars) if not bm]
         )
+
+        # Mutation handling: map allows in-place writes only to pos_args
+        # (lifted, loop-invariant tensors). Mutations of xs are unsafe
+        # (see MapImpl.gen_schema for the contract) so we graph-break here
+        # with a precise message. The remaining indices are mapped through
+        # the parent-side input list to produce a comma-joined
+        # ``mutated_arg_indices`` kwarg for the HOP call, mirroring
+        # scan / while_loop.
+        n_xs = len(unpacked_xs)
+
+        xs_mutated = sorted(i for i in body_mutated_inputs if i < n_xs)
+        if xs_mutated:
+            unimplemented(
+                gb_type="torch.map: f mutates xs",
+                context=f"xs={xs_mutated}",
+                explanation=(
+                    "map only supports in-place mutation of pos_args "
+                    "(loop-invariant tensors). xs[t] is a fresh, storage-"
+                    "disjoint slice each step, so a mutation cannot be "
+                    "observed by any other iteration. The only externally-"
+                    "observable effect of mutating xs[t] is a write-back to "
+                    "xs's t-th slice, which is already expressible via the "
+                    "f return value. For in-place lifted buffers, pass them "
+                    "via pos_args."
+                ),
+                hints=[
+                    *graph_break_hints.USER_ERROR,
+                ],
+            )
+
+        # pos_args (subgraph indices [n_xs, ...)) plus any lifted freevars
+        # (indices >= n_xs + n_pos_args). Both are carried as pos_args at
+        # the HOP-call layer.
+        all_map_inputs: list[VariableTracker | Proxy] = (
+            list(unpacked_xs)
+            + list(unpacked_args)
+            + list(body_lifted_freevars)
+        )
+        # Build a parent-storage set from the subgraph placeholders that were
+        # detected as mutated, then re-map through ``all_map_inputs`` so we
+        # cover both regular pos_args and lifted freevars.
+        mutated_input_storages = subgraph_mutated_input_storages(
+            body_graph,
+            {i for i in body_mutated_inputs if i >= n_xs},
+        )
+        mutated_inputs = parent_mutated_input_indices(
+            all_map_inputs, mutated_input_storages
+        )
+        mutated_arg_indices = ",".join(str(i) for i in mutated_inputs)
 
         body_nn_modules = dict(tx.output.nn_modules)
 
@@ -3405,9 +3462,14 @@ class MapHigherOrderVariable(TorchHigherOrderOperatorVariable):
             [arg.as_proxy() for arg in unpacked_args]
             + list(body_lifted_freevars.keys()),
         )
-
         return _call_function_and_unflatten_output(
-            tx, torch.ops.higher_order.map_impl, p_args, {}, None, body_spec, body_r
+            tx,
+            torch.ops.higher_order.map_impl,
+            p_args,
+            {"mutated_arg_indices": mutated_arg_indices},
+            None,
+            body_spec,
+            body_r,
         )
 
 
