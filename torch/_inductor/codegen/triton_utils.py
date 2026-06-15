@@ -311,11 +311,23 @@ def config_of(
             return False
         raise NotImplementedError(f"unhandled {type(x)}: {x}")
 
+    def include_tensor_alignment(arg: KernelArgType) -> bool:
+        return not (
+            V.graph.cpp_wrapper
+            and not V.graph.aot_mode
+            and isinstance(arg, TensorArg)
+            and arg.buffer in V.graph.graph_inputs
+        )
+
     if config.triton.divisible_by_16:
         divisible_by_16 = tuple(
             i
             for i, arg in zip(indices, args)
-            if is_aligned(arg, alignment=16, include_tensor=True)
+            if is_aligned(
+                arg,
+                alignment=16,
+                include_tensor=include_tensor_alignment(arg),
+            )
         )
     else:
         divisible_by_16 = ()
