@@ -234,34 +234,30 @@ static Tensor _mps_linear_backward_input(IntArrayRef input_size, const Tensor& g
     return output;
   }
 
+  // For >4D inputs, flatten to 2D outside the graph. The 2D flattening is required to avoid an older
+  // matmul bug (https://github.com/pytorch/pytorch/issues/114942), but doing it inside the graph
+  // (reshape -> matmul -> reshape) crashes the MLIR pass manager on macOS 26+
+  // (https://github.com/pytorch/pytorch/issues/187201). <=4D keeps the direct N-D matmul as before.
+  const bool needs_reshape = grad_output.dim() > 4;
+  auto grad_output_reshaped = needs_reshape ? grad_output.reshape({-1, grad_output.size(-1)}) : grad_output;
+  auto output_reshaped = needs_reshape ? output.view({-1, output.size(-1)}) : output;
+
   MPSStream* stream = getCurrentMPSStream();
 
   @autoreleasepool {
-    std::string key = "mps_linear_backward_input" + getTensorsStringKey({grad_output, weight_reshaped});
+    std::string key = "mps_linear_backward_input" + getTensorsStringKey({grad_output_reshaped, weight_reshaped});
     auto cachedGraph = LookUpOrCreateCachedGraph<CachedGraph>(key, [&](auto* mpsGraph, auto* newCachedGraph) {
       newCachedGraph->weightTensor_ = mpsGraphRankedPlaceHolder(mpsGraph, weight_reshaped);
-      newCachedGraph->gradOutputTensor_ = mpsGraphRankedPlaceHolder(mpsGraph, grad_output);
+      newCachedGraph->gradOutputTensor_ = mpsGraphRankedPlaceHolder(mpsGraph, grad_output_reshaped);
 
-      // MPS matrixMultiplication crashes for 5D+ tensors on 14.2.1 with `New volume should match old volume`
-      // See https://github.com/pytorch/pytorch/issues/114942 for more details
-      bool needReshape = grad_output.dim() > 4;
-      auto gradOutputTensor = needReshape
-          ? [mpsGraph flatten2DTensor:newCachedGraph->gradOutputTensor_ axis:-1 name:nil]
-          : newCachedGraph->gradOutputTensor_;
-
-      auto outputTensor = [mpsGraph matrixMultiplicationWithPrimaryTensor:gradOutputTensor
-                                                          secondaryTensor:newCachedGraph->weightTensor_
-                                                                     name:nil];
-      if (needReshape) {
-        outputTensor = [mpsGraph reshapeTensor:outputTensor withShape:getMPSShape(output) name:nil];
-      }
-
-      newCachedGraph->outputTensor_ = outputTensor;
+      newCachedGraph->outputTensor_ = [mpsGraph matrixMultiplicationWithPrimaryTensor:newCachedGraph->gradOutputTensor_
+                                                                      secondaryTensor:newCachedGraph->weightTensor_
+                                                                                 name:nil];
     });
 
     Placeholder weightPlaceholder = Placeholder(cachedGraph->weightTensor_, weight_reshaped);
-    Placeholder gradOutputPlaceholder = Placeholder(cachedGraph->gradOutputTensor_, grad_output);
-    Placeholder outputPlaceholder = Placeholder(cachedGraph->outputTensor_, output);
+    Placeholder gradOutputPlaceholder = Placeholder(cachedGraph->gradOutputTensor_, grad_output_reshaped);
+    Placeholder outputPlaceholder = Placeholder(cachedGraph->outputTensor_, output_reshaped);
 
     auto feeds = dictionaryFromPlaceholders(weightPlaceholder, gradOutputPlaceholder);
     runMPSGraph(stream, cachedGraph->graph(), feeds, outputPlaceholder);
