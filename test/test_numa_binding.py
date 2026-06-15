@@ -40,6 +40,7 @@ class MockDeviceProperties:
 _real_open = open
 
 
+@skipIfTorchDynamo("Dynamo tracing bypasses unittest.mock patches used by NUMA binding tests")
 @skipUnless(sys.platform == "linux", "Only linux currently supported")
 @skipUnless(
     torch.distributed.is_available(), "Need access to some distributed submodules"
@@ -659,9 +660,6 @@ class NumaBindingTest(TestCase):
             ("numactl", "--physcpubind=0-1", "echo", "Hello, world!"),
         )
 
-    @skipIfTorchDynamo(
-        "Dynamo tracing bypasses unittest.mock patches used by NUMA binding tests"
-    )
     def test_binds_to_node_0_if_node_stored_as_minus_one(self) -> None:
         self._add_mock_hardware(
             num_sockets=1,
@@ -692,9 +690,6 @@ class NumaBindingTest(TestCase):
             ("numactl", "--physcpubind=0-1", "echo", "Hello, world!"),
         )
 
-    @skipIfTorchDynamo(
-        "Dynamo tracing bypasses unittest.mock patches used by NUMA binding tests"
-    )
     def test_callable_entrypoint_basic(self) -> None:
         self._add_mock_hardware(
             num_sockets=4,
