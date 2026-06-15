@@ -3462,11 +3462,14 @@ class MapHigherOrderVariable(TorchHigherOrderOperatorVariable):
             [arg.as_proxy() for arg in unpacked_args]
             + list(body_lifted_freevars.keys()),
         )
+        hop_kwargs = (
+            {"mutated_arg_indices": mutated_arg_indices} if mutated_arg_indices else {}
+        )
         return _call_function_and_unflatten_output(
             tx,
             torch.ops.higher_order.map_impl,
             p_args,
-            {"mutated_arg_indices": mutated_arg_indices},
+            hop_kwargs,
             None,
             body_spec,
             body_r,
