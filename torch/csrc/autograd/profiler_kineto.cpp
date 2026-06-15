@@ -23,6 +23,8 @@
 #include <stdexcept>
 #include <utility>
 
+#include <fmt/format.h>
+
 #ifdef USE_KINETO
 #include <ApproximateClock.h>
 #include <libkineto.h>
