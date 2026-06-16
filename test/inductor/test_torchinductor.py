@@ -17924,7 +17924,7 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @requires_gpu_and_triton
     @config.patch(runtime_triton_nan_asserts=True)
-    def test_nan_asserts_in_launcher_wrapper_only(self):
+    def test_nan_assert_inside_triton_kernel(self):
         def fn(x):
             x = x - 1
             # Uncomment the following line can trigger the failure of
@@ -17935,9 +17935,7 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         compiled = torch.compile(fn)
         x = torch.randn(4096, device=GPU_TYPE)
         out, (code,) = run_and_get_code(compiled, x)
-        self.assertNotIn("tl.device_assert", code)
-        self.assertNotIn("'NaN or Inf found'", code)
-        self.assertIn(".isnan().any().item()", code)
+        self.assertTrue("'NaN or Inf found'" in code)
         torch.testing.assert_close(out, fn(x))
 
     @unittest.skipIf(

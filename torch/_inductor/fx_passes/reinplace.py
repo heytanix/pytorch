@@ -821,7 +821,11 @@ def _is_layout_preserving_view_copy_back(
 def _is_control_deps_ordering_only_use(
     user: torch.fx.Node, view: torch.fx.Node
 ) -> bool:
-    """Check if view appears only in control_deps' ordering-only additional_deps tuple."""
+    """Check if view appears only in control_deps' ordering-only additional_deps tuple.
+
+    control_deps schema (control_dependencies.py): control_deps(additional_deps, subgraph, *args)
+    kwargs is always empty -- preserve_node_ordering threads all nodes positionally.
+    """
     if not (
         user.op == "call_function"
         and isinstance(user.target, torch._ops.HigherOrderOperator)

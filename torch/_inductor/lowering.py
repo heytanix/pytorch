@@ -9065,27 +9065,27 @@ def control_deps_op_lowering(additional_deps, subgraph_fn, *args):
     # ops as mutating the pass-through buffers so the scheduler's mutation
     # rename chain forces readers after the subgraph boundary.
     input_ids = OrderedSet([id(a) for a in args])
+
+    def _add_passthrough_mutation(val, op):
+        if id(val) not in input_ids or not isinstance(val, IRNode):
+            return
+        val.realize()
+        op.mutation_outputs.append(
+            ir.MutationOutput(
+                ir.NoneLayout(device=val.get_device()),
+                val,
+                op,
+            )
+        )
+
     for op in subgraph_ops:
         if not isinstance(op, ir.ExternKernel):
             continue
-
-        def _add_passthrough_mutations(val, op=op):
-            if id(val) not in input_ids or not isinstance(val, IRNode):
-                return
-            val.realize()
-            op.mutation_outputs.append(
-                ir.MutationOutput(
-                    ir.NoneLayout(device=val.get_device()),
-                    val,
-                    op,
-                )
-            )
-
         if isinstance(output, (list, tuple)):
             for v in output:
-                _add_passthrough_mutations(v)
+                _add_passthrough_mutation(v, op)
         else:
-            _add_passthrough_mutations(output)
+            _add_passthrough_mutation(output, op)
 
     return output
 

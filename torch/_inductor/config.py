@@ -12,7 +12,6 @@ from torch.utils._config_module import (
     inherit_fields_from,
     install_config_module,
 )
-from torch.utils._ordered_set import OrderedSet
 
 
 if TYPE_CHECKING:
@@ -232,8 +231,6 @@ static_weight_shapes = True
 # put correctness assertions in generated code
 size_asserts = os.environ.get("TORCHINDUCTOR_SIZE_ASSERTS", "1") == "1"
 nan_asserts = os.environ.get("TORCHINDUCTOR_NAN_ASSERTS") == "1"
-# NaN asserts are now emitted from the launcher wrapper only, not inside
-# Triton kernels.  Setting this enables nan_asserts (kept for backward compat).
 runtime_triton_nan_asserts = (
     os.environ.get("TORCHINDUCTOR_RUNTIME_TRITON_NAN_ASSERTS") == "1"
 )

@@ -2777,6 +2777,9 @@ class CSEProxy(DefaultHandler):
                 if shape_to_check is not None:
                     check_shape(V.kernel.compute, csevar, shape_to_check)
 
+            if config.runtime_triton_nan_asserts:
+                check_nan(V.kernel.compute, csevar)
+
             return csevar
 
         return pytree.tree_map(do_cse, value)
