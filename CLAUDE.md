@@ -140,8 +140,8 @@ Follow these rules for all code changes in this repository:
   on the code that is being read, but they should have some experience in the
   area.
 - Splitting code across multiple lines (due to ruff’s column limit rule) is less
-  readable than having code on a single line. For all cases where the linter splits
-  your code across multiple lines, please try to put it back on a single line by
+  readable than having code on a single line. When the linter splits your
+  code across multiple lines, please try to put it back on a single line by
   changing variable names or by using helper local variables. For tests that assert
   against a golden string, keep just the golden string on one line instead of
   splitting it across multiple names and opt-out of the ruff column limit rule
