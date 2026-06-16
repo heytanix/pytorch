@@ -4619,6 +4619,7 @@ class TestVmapOperatorsOpInfo(TestCase):
                     "searchsorted"
                 ),  # aten::searchsorted.Scalar hit the vmap fallback which is currently disabled
                 xfail("native_group_norm"),
+                xfail("torch.ops.aten._scaled_dot_product_flash_attention_for_cpu"),
             }
         ),
     )

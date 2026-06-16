@@ -359,9 +359,9 @@ void cpu_flash_attention(
   //    -> (Batch x KV_seq_len   x KV_num_heads x Dim_per_head)
   // Value (Batch x KV_num_heads x KV_seq_len   x Dim_per_head)
   //    -> (Batch x KV_seq_len   x KV_num_heads x Dim_per_head)
-  at::Tensor query = q.stride(-1) == 1 ? q.transpose(1, 2) : q.transpose(1, 2).contiguous();
-  at::Tensor key = k.stride(-1) == 1 ? k.transpose(1, 2) : k.transpose(1, 2).contiguous();
-  at::Tensor value = v.stride(-1) == 1 ? v.transpose(1, 2) : v.transpose(1, 2).contiguous();
+  const at::Tensor query = q.stride(-1) == 1 ? q.transpose(1, 2) : q.transpose(1, 2).contiguous();
+  const at::Tensor key = k.stride(-1) == 1 ? k.transpose(1, 2) : k.transpose(1, 2).contiguous();
+  const at::Tensor value = v.stride(-1) == 1 ? v.transpose(1, 2) : v.transpose(1, 2).contiguous();
 
   constexpr bool is_reduced_type = is_reduced_floating_point_v<scalar_t>;
   using accum_t = at::opmath_type<scalar_t>;
@@ -810,12 +810,14 @@ void cpu_flash_attention_backward(
   constexpr bool is_reduced_type = is_reduced_floating_point_v<scalar_t>;
   using accum_t = at::opmath_type<scalar_t>;
   using Vec = vec::Vectorized<accum_t>;
+
   // Query (Batch x Q_seq_len  x Num_heads    x Dim_per_head)
   // Key   (Batch x KV_seq_len x KV_num_heads x Dim_per_head)
   // Value (Batch x KV_seq_len x KV_num_heads x Dim_per_head)
-  at::Tensor query = q.stride(-1) == 1 ? q.transpose(1, 2) : q.transpose(1, 2).contiguous();
-  at::Tensor key = k.stride(-1) == 1 ? k.transpose(1, 2) : k.transpose(1, 2).contiguous();
-  at::Tensor value = v.stride(-1) == 1 ? v.transpose(1, 2) : v.transpose(1, 2).contiguous();
+  const at::Tensor query = q.stride(-1) == 1 ? q.transpose(1, 2) : q.transpose(1, 2).contiguous();
+  const at::Tensor key = k.stride(-1) == 1 ? k.transpose(1, 2) : k.transpose(1, 2).contiguous();
+  const at::Tensor value = v.stride(-1) == 1 ? v.transpose(1, 2) : v.transpose(1, 2).contiguous();
+
   accum_t scaling_factor =
       sdp::calculate_scale(query, scale).expect_float();
 
