@@ -4524,6 +4524,7 @@ class TestVmapOperatorsOpInfo(TestCase):
                 xfail("nn.functional.scaled_dot_product_attention"),  # randomness
                 xfail("nn.functional.multi_head_attention_forward"),  # randomness
                 xfail("torch.ops.aten._efficient_attention_forward"),  # outputs ints
+                xfail("torch.ops.aten._scaled_dot_product_flash_attention_for_cpu"),
                 xfail("resize_"),
                 xfail("view_as_complex"),
                 xfail("fft.ihfft2"),
