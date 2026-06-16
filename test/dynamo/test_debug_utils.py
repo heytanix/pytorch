@@ -15,6 +15,7 @@ from torch._dynamo.debug_utils import (
 from torch._dynamo.test_case import TestCase
 from torch.fx.experimental.proxy_tensor import make_fx
 from torch.testing._internal.common_device_type import instantiate_device_type_tests
+from troch._internal.inductor_utils import GPU_TYPE
 
 
 f32 = torch.float32
@@ -271,7 +272,7 @@ class TestNNModuleToStringBufferDevice(TestCase):
         else:
             expected_device = str(torch.empty(1, device=device).device)
             self.assertIn(f'device="{expected_device}"', result)
-            self.assertNotIn(', device="cuda")', result)
+            self.assertNotIn(', device=GPU_TYPE)', result)
 
 
 instantiate_device_type_tests(
@@ -844,7 +845,7 @@ class TestInductorConfigOverrideIntegration(TestCase):
 
 
 instantiate_device_type_tests(
-    TestInductorConfigOverrideIntegration, globals(), only_for=["cpu", "cuda"]
+    TestInductorConfigOverrideIntegration, globals(), only_for=["cpu", "cuda", "xpu"], allow_xpu=True
 )
 
 
