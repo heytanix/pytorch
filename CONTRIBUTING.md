@@ -55,7 +55,7 @@ aspects of contributing to PyTorch.
 - [Windows development tips](#windows-development-tips)
   - [Known MSVC (and MSVC with NVCC) bugs](#known-msvc-and-msvc-with-nvcc-bugs)
   - [Building on legacy code and CUDA](#building-on-legacy-code-and-cuda)
-- [Pre-commit tidy/linting hook](#pre-commit-tidylinting-hook)
+- [Linting before committing](#linting-before-committing)
 - [Building PyTorch with ASAN](#building-pytorch-with-asan)
   - [Getting `ccache` to work](#getting-ccache-to-work)
   - [Why this stuff with `LD_PRELOAD` and `LIBASAN_RT`?](#why-this-stuff-with-ld_preload-and-libasan_rt)
@@ -571,9 +571,9 @@ pip install -r requirements.txt
 ```
 > Note: if you installed `nodejs` with a different package manager then `npm` will probably install a version of `katex` that is not
 compatible with your version of `nodejs` and doc builds will fail.
-A combination of versions that is known to work is `node@6.13.1` and
-`katex@0.13.18`. To install the latter with `npm` you can run
-```npm install -g katex@0.13.18```
+A combination of versions that is known to work is `node@22` (current LTS) and
+`katex@0.16.10`. To install the latter with `npm` you can run
+```npm install -g katex@0.16.10```
 
 
 > Note that if you are a Facebook employee using a devserver, yarn may be more convenient to install katex:
@@ -581,7 +581,7 @@ A combination of versions that is known to work is `node@6.13.1` and
 ```bash
 yarn global add katex
 ```
-> If a specific version is required you can use for example `yarn global add katex@0.13.18`.
+> If a specific version is required you can use for example `yarn global add katex@0.16.10`.
 
 3. Generate the documentation HTML files. The generated files will be in `docs/build/html`.
 
@@ -619,7 +619,7 @@ For C++ documentation (https://pytorch.org/cppdocs), we use
 reference](https://www.doxygen.nl/manual/) for more
 information on the documentation syntax.
 
-We run Doxygen in CI (Travis) to verify that you do not use invalid Doxygen
+We run Doxygen in CI to verify that you do not use invalid Doxygen
 commands. To run this check locally, run `./check-doxygen.sh` from inside
 `docs/cpp/source`.
 
@@ -1054,7 +1054,7 @@ If you are working on the CUDA code, here are some useful CUDA debugging tips:
 1. `CUDA_DEVICE_DEBUG=1` will enable CUDA device function debug symbols (`-g -G`).
     This will be particularly helpful in debugging device code. However, it will
     slow down the build process for about 50% (compared to only `DEBUG=1`), so use wisely.
-2. `cuda-gdb` and `cuda-memcheck` are your best CUDA debugging friends. Unlike`gdb`,
+2. `cuda-gdb` and `compute-sanitizer` are your best CUDA debugging friends. Unlike`gdb`,
    `cuda-gdb` can display actual values in a CUDA tensor (rather than all zeros).
 3. CUDA supports a lot of C++17/20 features, which include `std::numeric_limits`, `std::nextafter`,
    `if constexpr` etc. in device code. Many of such features are possible because of the
@@ -1183,8 +1183,9 @@ static_assert(std::is_same(A*, decltype(A::singleton()))::value, "hmm");
 ```
 
 * The compiler will run out of heap space if you attempt to compile files that
-  are too large. Splitting such files into separate files helps.
-  (Example: `THTensorMath`, `THTensorMoreMath`, `THTensorEvenMoreMath`.)
+  are too large. Splitting such files into separate files helps. This is why
+  the codegen shards large generated files (e.g. `VariableType.cpp` and
+  `RegisterCPU.cpp`); see Note [Sharded File] for details.
 
 * MSVC's preprocessor (but not the standard compiler) has a bug
   where it incorrectly tokenizes raw string literals, ending when it sees a `"`.
@@ -1202,26 +1203,25 @@ CUDA, MSVC, and PyTorch versions are interdependent; please install matching ver
 PyTorch requires CUDA 12.8+ and Visual Studio 2022 (17.X). Building PyTorch requires a C++20
 capable toolchain (GCC 11.3+, Clang 16+, or MSVC 2022).
 
-## Pre-commit tidy/linting hook
+## Linting before committing
 
-We use clang-tidy to perform additional
-formatting and semantic checking of code. We provide a pre-commit git hook for
-performing these checks, before a commit is created:
-
-  ```bash
-  ln -s ../../tools/git-pre-commit .git/hooks/pre-commit
-  ```
-
-If you have already committed files and
-CI reports `flake8` errors, you can run the check locally in your PR branch with:
+All linting (clang-tidy, flake8, formatting, and more) is run through
+[`lintrunner`](https://github.com/pytorch/pytorch/wiki/lintrunner). The
+easiest way to run it is via `spin`:
 
   ```bash
-  flake8 $(git diff --name-only $(git merge-base --fork-point main))
+  spin lint        # run the default lint
+  spin quicklint   # lint only files changed in the latest commit and working tree
+  spin quickfix    # autofix issues on those changed files
   ```
 
-You'll need to install an appropriately configured flake8; see
-[Lint as you type](https://github.com/pytorch/pytorch/wiki/Lint-as-you-type)
-for documentation on how to do this.
+You can also invoke `lintrunner` directly. With no arguments it lints the files
+changed relative to the merge-base, so just run:
+
+  ```bash
+  lintrunner          # lint changed files
+  lintrunner -a       # lint changed files and apply autofixes
+  ```
 
 Fix the code so that no errors are reported when you re-run the above check again,
 and then commit the fix.
