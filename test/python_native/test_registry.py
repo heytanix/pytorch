@@ -559,6 +559,46 @@ class TestRegistryRuntime(TestCase):
         self.assertEqual(out.shape, torch.Size([3, 4]))
         self.assertEqual(out.dtype, torch.float32)
 
+    def test_eager_router_declines_fake_tensors(self):
+        """The eager router must decline FakeTensors and fall through to the
+        native aten kernel rather than running the real DSL impl on fakes.
+
+        Fakes are meant to reach the impl only via the compile/export router
+        and its `_native::<id>` fake kernel, never the eager backend router.
+        """
+        impl_called = [False]
+
+        def cond(*a, **k):
+            return True
+
+        def impl(a, b):
+            impl_called[0] = True
+            return torch.full_like(a, 123.0)
+
+        self.registry.register_op_override(
+            "test_dsl", "aten", "mul.Tensor", "CPU", cond, impl
+        )
+        self._install("mul.Tensor", "CPU")
+
+        # Real tensors: the override fires.
+        a = torch.tensor([2.0, 3.0])
+        b = torch.tensor([4.0, 5.0])
+        self.assertTrue(
+            torch.equal(torch.ops.aten.mul.Tensor(a, b), torch.tensor([123.0, 123.0]))
+        )
+        self.assertTrue(impl_called[0])
+
+        # Fake tensors: the impl must not run; shape inference flows through
+        # the native aten kernel's meta instead.
+        impl_called[0] = False
+        with FakeTensorMode():
+            fa = torch.empty(3, 4, dtype=torch.float32)
+            fb = torch.empty(3, 4, dtype=torch.float32)
+            out = torch.ops.aten.mul.Tensor(fa, fb)
+        self.assertFalse(impl_called[0])
+        self.assertEqual(out.shape, torch.Size([3, 4]))
+        self.assertEqual(out.dtype, torch.float32)
+
     def test_unconditional_override_cond_none(self):
         """`cond=None` + `unconditional_override=True` must substitute a
         trivially-true predicate so the impl fires on every call.

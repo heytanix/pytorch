@@ -569,6 +569,24 @@ def _always_true(*args: object, **kwargs: object) -> bool:
     return True
 
 
+def _args_have_fake_tensor(args: tuple, kwargs: dict) -> bool:
+    """Return True if any (possibly nested) argument is a FakeTensor.
+
+    The eager router runs real DSL `impl` kernels at the backend key; a
+    FakeTensor reaching it would invoke a real kernel on fake data. Fakes
+    are instead meant to flow through the compile/export router via the
+    `_native::<id>` fake kernel. `is_fake` returns False for non-tensors,
+    so this is safe over arbitrary leaves.
+    """
+    # Local imports: both modules are already loaded by the time
+    # `import torch._native` runs (it imports last), so this is cheap and
+    # keeps module-level imports minimal.
+    from torch._subclasses.fake_tensor import is_fake
+    from torch.utils._pytree import tree_leaves
+
+    return any(is_fake(leaf) for leaf in tree_leaves((args, kwargs)))
+
+
 def register_op_override(
     backend: str,
     lib_symbol: str,
@@ -920,6 +938,13 @@ def _register_overrides_from_graph(
         return _NO_MATCH
 
     def eager_router(keyset, *args, _fallback=fallback_kernel, **kwargs):
+        # Decline FakeTensors universally: the eager router runs real DSL
+        # kernels, so a fake input must fall through to the native aten
+        # kernel (whose meta handles fakes). Fakes route to the DSL impl
+        # only via the compile/export router and its `_native::<id>` fake
+        # kernel.
+        if _args_have_fake_tensor(args, kwargs):
+            return _fallback.call_boxed(keyset, *args, **kwargs)
         result = _dispatch(args, kwargs, swallow_cond_exceptions=False)
         if result is _NO_MATCH:
             return _fallback.call_boxed(keyset, *args, **kwargs)
