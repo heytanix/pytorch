@@ -1171,50 +1171,24 @@ REGISTER_PRED_REDUCTIONS_FOR_TYPE(half2);
 // of just a value.
 // =============================================================================
 
+// Arg-ops piggyback on the value-ops via a ValueOp typedef for the identity
+// element and the SIMD value reduction (simd_max / simd_min); they only add
+// the strict NaN-propagating "should-replace" pair predicate used by the
+// per-thread scan and the outer-kernel shared-memory tree reduce. Metal SL
+// has no class inheritance, so composition via a typedef is what's available.
 struct ArgMaxOp {
-  template <
-      typename T,
-      ::metal::enable_if_t<!is_floating_point_v<T>, bool> = true>
-  static inline constexpr T identity() {
-    return ::metal::numeric_limits<T>::lowest();
-  }
-  // Float identity is -INFINITY (not -FLT_MAX); see MaxOp.
-  template <
-      typename T,
-      ::metal::enable_if_t<is_floating_point_v<T>, bool> = true>
-  static inline constexpr T identity() {
-    return T(-INFINITY);
-  }
+  using ValueOp = MaxOp;
   template <typename T>
-  static inline bool better(T cand, T cur) {
+  static inline bool replace(T cand, T cur) {
     return c10::metal::argmax_replace(cand, cur);
-  }
-  template <typename T>
-  static inline T simd_value_reduce(T val) {
-    return c10::metal::simd_max(val);
   }
 };
 
 struct ArgMinOp {
-  template <
-      typename T,
-      ::metal::enable_if_t<!is_floating_point_v<T>, bool> = true>
-  static inline constexpr T identity() {
-    return ::metal::numeric_limits<T>::max();
-  }
-  template <
-      typename T,
-      ::metal::enable_if_t<is_floating_point_v<T>, bool> = true>
-  static inline constexpr T identity() {
-    return T(INFINITY);
-  }
+  using ValueOp = MinOp;
   template <typename T>
-  static inline bool better(T cand, T cur) {
+  static inline bool replace(T cand, T cur) {
     return c10::metal::argmin_replace(cand, cur);
-  }
-  template <typename T>
-  static inline T simd_value_reduce(T val) {
-    return c10::metal::simd_min(val);
   }
 };
 
@@ -1229,7 +1203,7 @@ template <
     typename TA,
     ::metal::enable_if_t<is_floating_point_v<TA>, bool> = true>
 inline c10::metal::pair<TA, uint32_t> simd_arg_reduce(TA val, uint32_t idx) {
-  const TA winner = Op::template simd_value_reduce<TA>(val);
+  const TA winner = Op::ValueOp::template simd_reduce<TA>(val);
   const bool is_winner = ::metal::isnan(val) || (val == winner);
   const uint32_t eff_idx =
       is_winner ? idx : ::metal::numeric_limits<uint32_t>::max();
@@ -1241,7 +1215,7 @@ template <
     typename TA,
     ::metal::enable_if_t<!is_floating_point_v<TA>, bool> = true>
 inline c10::metal::pair<TA, uint32_t> simd_arg_reduce(TA val, uint32_t idx) {
-  const TA winner = Op::template simd_value_reduce<TA>(val);
+  const TA winner = Op::ValueOp::template simd_reduce<TA>(val);
   const uint32_t eff_idx =
       (val == winner) ? idx : ::metal::numeric_limits<uint32_t>::max();
   return {winner, ::metal::simd_min(eff_idx)};
@@ -1249,8 +1223,8 @@ inline c10::metal::pair<TA, uint32_t> simd_arg_reduce(TA val, uint32_t idx) {
 
 // Pair tie-break for the shared-memory tree reduction in the outer-dim
 // kernel: cand replaces cur if strictly better OR (equal AND lower idx).
-// `Op::better` already handles NaN propagation; equality here is the
-// !better-either-way fallback, which subsumes both both-NaN and both-equal
+// `Op::replace` already handles NaN propagation; equality here is the
+// !replace-either-way fallback, which subsumes both both-NaN and both-equal
 // cases.
 template <typename Op, typename TA>
 inline bool arg_replace(
@@ -1258,10 +1232,10 @@ inline bool arg_replace(
     uint32_t cand_idx,
     TA cur_val,
     uint32_t cur_idx) {
-  if (Op::better(cand_val, cur_val)) {
+  if (Op::replace(cand_val, cur_val)) {
     return true;
   }
-  if (Op::better(cur_val, cand_val)) {
+  if (Op::replace(cur_val, cand_val)) {
     return false;
   }
   return cand_idx < cur_idx;
@@ -1306,7 +1280,7 @@ kernel void arg_reduction(
     }
   }
 
-  TA best_val = Op::template identity<TA>();
+  TA best_val = Op::ValueOp::template identity<TA>();
   uint32_t best_idx = 0;
   const uint32_t rsize = params.reduction_size;
 
@@ -1314,7 +1288,7 @@ kernel void arg_reduction(
     for (uint32_t idx = tid; idx < rsize; idx += tptg) {
       const TA val =
           static_cast<TA>(input[input_base + idx * reduction_stride]);
-      if (Op::better(val, best_val)) {
+      if (Op::replace(val, best_val)) {
         best_val = val;
         best_idx = idx;
       }
@@ -1323,7 +1297,7 @@ kernel void arg_reduction(
     for (uint32_t idx = tid; idx < rsize; idx += tptg) {
       const TA val =
           static_cast<TA>(input[get_input_offset(idx, tgid, params)]);
-      if (Op::better(val, best_val)) {
+      if (Op::replace(val, best_val)) {
         best_val = val;
         best_idx = idx;
       }
@@ -1348,8 +1322,8 @@ kernel void arg_reduction(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (tid < simdgroup_size) {
-      const TA v =
-          (tid < nsimd) ? shared_vals[tid] : Op::template identity<TA>();
+      const TA v = (tid < nsimd) ? shared_vals[tid]
+                                 : Op::ValueOp::template identity<TA>();
       const uint32_t i = (tid < nsimd)
           ? shared_idxs[tid]
           : ::metal::numeric_limits<uint32_t>::max();
@@ -1404,11 +1378,11 @@ kernel void arg_reduction_inner(
 
   constant TI* row_ptr = input + row * N;
 
-  TA best_val = Op::template identity<TA>();
+  TA best_val = Op::ValueOp::template identity<TA>();
   uint32_t best_idx = 0;
   for (uint i = simd_lane_id; i < N; i += simdgroup_size) {
     const TA val = static_cast<TA>(row_ptr[i]);
-    if (Op::better(val, best_val)) {
+    if (Op::replace(val, best_val)) {
       best_val = val;
       best_idx = i;
     }
@@ -1447,11 +1421,11 @@ kernel void arg_reduction_outer(
   const uint row_start = tid_tg.y * rows_per_y;
   const uint row_end = min(row_start + rows_per_y, M);
 
-  TA best_val = Op::template identity<TA>();
+  TA best_val = Op::ValueOp::template identity<TA>();
   uint32_t best_idx = 0;
   for (uint row = row_start; row < row_end; row++) {
     const TA val = static_cast<TA>(input[row * N + col]);
-    if (Op::better(val, best_val)) {
+    if (Op::replace(val, best_val)) {
       best_val = val;
       best_idx = row;
     }
