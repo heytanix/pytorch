@@ -6739,7 +6739,8 @@ class TestTransferSymbolsFromForeignShapeEnv(TestCase):
             self.assertTrue(local_env.is_unbacked_symint(sym))
 
     def test_foreign_unbacked_transfer_preserves_derived_tensor_expr(self):
-        """Tensor and raw SymInt derived expressions share transferred symbols."""
+        """Derived tensor dims are minted as opaque symbols; raw SymInt with
+        the same expression reuses that symbol via the (env, expr) cache."""
         foreign_env = ShapeEnv()
         global_tokens = foreign_env.create_unbacked_symint()
         hidden = foreign_env.create_unbacked_symint()
@@ -6761,8 +6762,10 @@ class TestTransferSymbolsFromForeignShapeEnv(TestCase):
         self.assertEqual(raw_derived_tokens.node.expr, new_sizes[0].node.expr)
         self.assertEqual(new_strides[0].node.expr, new_sizes[1].node.expr)
         self.assertEqual(len(raw_derived_tokens.node.expr.free_symbols), 1)
-        derived_global_tokens = next(iter(raw_derived_tokens.node.expr.free_symbols))
-        self.assertEqual(local_env.var_to_hint_override[derived_global_tokens], 64)
+        derived_token_sym = next(iter(raw_derived_tokens.node.expr.free_symbols))
+        # `derived_tokens` (= global_tokens // 2) is minted as one fresh
+        # opaque symbol; its hint is the foreign expression's hint (64 // 2).
+        self.assertEqual(local_env.var_to_hint_override[derived_token_sym], 32)
         self.assertEqual(local_env.var_to_hint_override[new_sizes[1].node.expr], 128)
 
     def test_foreign_unbacked_transfer_preserves_shared_token_grid(self):

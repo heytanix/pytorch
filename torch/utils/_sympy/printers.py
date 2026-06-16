@@ -273,8 +273,6 @@ class PythonPrinter(ExprPrinter):
 
     def _fold_binary_call(self, fn: str, args: Sequence[sympy.Expr]) -> str:
         printed = [self._print(a) for a in args]
-        if len(printed) == 1:
-            return printed[0]
         result = printed[-1]
         for arg in reversed(printed[:-1]):
             result = f"{fn}({arg}, {result})"

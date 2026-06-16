@@ -4029,8 +4029,12 @@ class ShapeEnv:
         # multiple values, e.g. a tensor size and a raw SymInt closure capture.
         # Cache by the foreign base symbol so every transferred expression is
         # rebuilt from one local symbol and provenance stays coherent.
+        # Cached mapping from (foreign ShapeEnv id, foreign expression) to the
+        # local unbacked symbol that represents it.  Keyed by sympy.Expr because
+        # we cache both single-symbol entries (e.g. u0) and whole-expression
+        # entries (e.g. u3+u4) so that recurring expressions share symbols.
         self.foreign_unbacked_symbol_cache: dict[
-            tuple[int, sympy.Symbol], sympy.Symbol
+            tuple[int, sympy.Expr], sympy.Symbol
         ] = {}
         # Maps a source to the *original* symbol that was assigned to it
         self.source_to_var: dict[str, sympy.Symbol] = {}
@@ -4857,76 +4861,70 @@ class ShapeEnv:
             return src_shape_env.optimization_hint(expr)
         return None
 
-    def _transfer_foreign_unbacked_symbol(
-        self,
-        src_shape_env: ShapeEnv,
-        old_symbol: sympy.Symbol,
-        *,
-        source: Source | None = None,
-        is_size: bool = False,
-    ) -> sympy.Symbol:
-        if not src_shape_env.is_unbacked_symint(old_symbol):
-            raise AssertionError(f"{old_symbol} is not a foreign unbacked SymInt.")
-
-        cache_key = (id(src_shape_env), old_symbol)
-        new_symbol = self.foreign_unbacked_symbol_cache.get(cache_key)
-        if new_symbol is None:
-            with self.ignore_fresh_unbacked_symbols():
-                new_symint = self.create_unbacked_symint(source)
-            new_symbol = new_symint.node.expr
-            self.foreign_unbacked_symbol_cache[cache_key] = new_symbol
-            self._register_foreign_unbacked_symbol(
-                new_symbol,
-                source=source,
-                value_range=src_shape_env.bound_sympy(old_symbol),
-                hint=self._foreign_unbacked_hint(src_shape_env, old_symbol),
-            )
-        else:
-            self._register_foreign_unbacked_symbol(new_symbol, source=source)
-
-        if is_size:
-            self._constrain_range_for_size(new_symbol)
-        return new_symbol
-
-    def _transfer_foreign_unbacked_expr(
+    def _transfer_foreign_expr(
         self,
         value: SymInt,
         *,
         source: Source | None = None,
         is_size: bool = False,
-        replacements: dict[sympy.Expr, sympy.Expr] | None = None,
-        fresh_for_leftover: bool = True,
     ) -> sympy.Expr:
-        """Rebuild ``value`` in this ShapeEnv by transferring its foreign
-        unbacked symbols.  If after substitution the expression still
-        references symbols this env doesn't own (e.g. backed foreign symbols
-        mixed with unbacked, or anything coming from ``as_strided``), and
-        ``fresh_for_leftover`` is True, replace the whole expression with a
-        fresh local unbacked symbol.  Callers that need a different fallback
-        (e.g. tensor sizes, which want a sourced symbol) should pass
-        ``fresh_for_leftover=False`` and handle leftovers externally."""
+        """Transfer a foreign SymInt expression into this ShapeEnv.
+
+        Algorithm (used uniformly for tensor sizes, strides, storage offsets,
+        and raw SymInt inputs):
+        1. Replace any foreign symbols in ``value.expr`` that are already in
+           the per-symbol cache (cache-only — no minting yet).
+        2. If every free symbol got replaced, return the resulting (possibly
+           derived) expression as-is.
+        3. Otherwise mint ONE fresh local unbacked symbol for the whole
+           foreign expression, attach the caller's ``source`` to it, register
+           its value range / hint from the foreign env, and cache
+           ``(foreign_env, foreign_expr) -> new_symbol`` so a future call
+           with the same expression reuses the symbol.
+
+        Note: this loses fine-grained relationships when a derived expression
+        is minted before its base symbols are seen individually (e.g. minting
+        a symbol for ``u0 + u1`` before any tensor dim carries ``u0`` or
+        ``u1`` alone — later occurrences of those bare symbols cannot share
+        with the minted derived symbol).  This is consistent with the
+        pre-refactor behavior."""
         src_shape_env = value.node.shape_env
         if src_shape_env is None:
             return value.node.expr
         expr = value.node.expr
-        old_to_new: dict[sympy.Expr, sympy.Expr] = (
-            {} if replacements is None else replacements
-        )
-        for old_symbol in sorted(expr.free_symbols, key=str):
-            if src_shape_env.is_unbacked_symint(old_symbol):
-                if old_symbol not in old_to_new:
-                    old_to_new[old_symbol] = self._transfer_foreign_unbacked_symbol(
-                        src_shape_env,
-                        old_symbol,
-                        source=source if expr == old_symbol and not is_size else None,
-                        is_size=is_size and expr == old_symbol,
-                    )
-        new_expr = expr.xreplace(old_to_new)
-        if fresh_for_leftover and (
-            new_expr.free_symbols - set(old_to_new.values())
-        ):
-            new_expr = self.create_unbacked_symint().node.expr
-        return new_expr
+
+        # Step 1: cache-only replacement.
+        cache_map = {
+            sym: self.foreign_unbacked_symbol_cache[(id(src_shape_env), sym)]
+            for sym in expr.free_symbols
+            if (id(src_shape_env), sym) in self.foreign_unbacked_symbol_cache
+        }
+        new_expr = expr.xreplace(cache_map) if cache_map else expr
+
+        # Step 2: all symbols resolved from cache — use the derived expression.
+        if not (new_expr.free_symbols - set(cache_map.values())):
+            return new_expr
+
+        # Step 3: at least one symbol could not be resolved.  Mint one fresh
+        # symbol for the whole foreign expression and cache by expression.
+        expr_key = (id(src_shape_env), expr)
+        cached = self.foreign_unbacked_symbol_cache.get(expr_key)
+        if cached is None:
+            with self.ignore_fresh_unbacked_symbols():
+                new_symint = self.create_unbacked_symint(source)
+            cached = new_symint.node.expr
+            self.foreign_unbacked_symbol_cache[expr_key] = cached
+            self._register_foreign_unbacked_symbol(
+                cached,
+                source=source,
+                value_range=src_shape_env.bound_sympy(expr),
+                hint=self._foreign_unbacked_hint(src_shape_env, expr),
+            )
+            if is_size:
+                self._constrain_range_for_size(cached)
+        else:
+            self._register_foreign_unbacked_symbol(cached, source=source)
+        return cached
 
     def transfer_unbacked_symint_from_foreign_shape_env(
         self,
@@ -4935,12 +4933,11 @@ class ShapeEnv:
     ) -> SymInt:
         """Lift a raw foreign unbacked SymInt as an input in this ShapeEnv.
 
-        The helper transfers each foreign unbacked symbol (registering its
-        hint via var_to_hint_override) and falls back to a fresh local
-        unbacked symbol if any foreign symbols cannot be translated.  No
-        hint is passed to create_symintnode here because the expression is
-        always unbacked (create_symintnode would null it out anyway)."""
-        new_expr = self._transfer_foreign_unbacked_expr(value, source=source)
+        Uses _transfer_foreign_expr which mints one fresh local symbol for
+        any whole foreign expression that cannot be fully resolved from
+        already-cached symbols.  The user's source is attached to that fresh
+        symbol so the resulting graph input is always 1 source <-> 1 symbol."""
+        new_expr = self._transfer_foreign_expr(value, source=source)
         return cast(
             SymInt,
             self.create_symintnode(new_expr, hint=None, source=source),
@@ -5041,43 +5038,20 @@ class ShapeEnv:
         # size/stride/offset expression from that mapping.  The same ShapeEnv
         # cache is also used for raw foreign SymInt inputs, so a tensor dim
         # `u0` and a closure-captured SymInt `u0` become the same local symbol.
-        old_to_new: dict[sympy.Expr, sympy.Expr] = {}
         new_size_exprs: list[sympy.Expr] = []
         for i, old_sz in enumerate(sizes):
             if is_symbolic(old_sz):
                 old_symint = cast(SymInt, old_sz)
-                old_expr = old_symint.node.expr
                 size_source = TensorPropertySource(source, TensorProperty.SIZE, i)
                 if dynamic_sizes[i] is DimDynamic.UNBACKED:
-                    # Opt out of the helper's fresh-unbacked fallback: for size
-                    # dims we want to fall back to create_symbol so the new
-                    # symbol gets the proper TensorPropertySource attachment.
-                    new_expr = self._transfer_foreign_unbacked_expr(
-                        old_symint,
-                        source=size_source,
-                        is_size=True,
-                        replacements=old_to_new,
-                        fresh_for_leftover=False,
+                    new_expr = self._transfer_foreign_expr(
+                        old_symint, source=size_source, is_size=True
                     )
-                    if new_expr.free_symbols - set(old_to_new.values()):
-                        new_expr = self.create_symbol(
-                            ex_size[i],  # type: ignore[arg-type]
-                            size_source,
-                            dynamic_sizes[i],
-                            symbolic_context.constraint_sizes[i]
-                            if hasattr(symbolic_context, "constraint_sizes")
-                            else None,  # type: ignore[attr-defined]
-                            symbolic_context=symbolic_context,
-                        )
-                    old_to_new[old_expr] = new_expr
-                    new_size_exprs.append(new_expr)
-                    continue
-
-                new_expr = old_expr.xreplace(old_to_new)
-                if new_expr.free_symbols - set(old_to_new.values()):
-                    # Still has unmapped foreign symbols — create fresh symbol
-                    sym = self.create_symbol(
-                        ex_size[i],  # type: ignore[arg-type]  # None for UNBACKED, ignored
+                else:
+                    # Backed dim through the legacy create_symbol path so the
+                    # standard size machinery handles source/range bookkeeping.
+                    new_expr = self.create_symbol(
+                        ex_size[i],  # type: ignore[arg-type]
                         size_source,
                         dynamic_sizes[i],
                         symbolic_context.constraint_sizes[i]
@@ -5085,10 +5059,7 @@ class ShapeEnv:
                         else None,  # type: ignore[attr-defined]
                         symbolic_context=symbolic_context,
                     )
-                    old_to_new[old_expr] = sym
-                    new_size_exprs.append(sym)
-                else:
-                    new_size_exprs.append(new_expr)
+                new_size_exprs.append(new_expr)
             else:
                 new_size_exprs.append(sympy.Integer(old_sz))
 
@@ -5096,24 +5067,25 @@ class ShapeEnv:
         # If after substitution a stride still has foreign symbols (e.g. from
         # as_strided), create a fresh unbacked symbol for it.
         new_stride_exprs: list[sympy.Expr] = []
-        for sd in strides:
+        for i, sd in enumerate(strides):
             if is_symbolic(sd):
-                # Helper falls back to a fresh unbacked symbol if a stride
-                # references a foreign symbol not in any size dim (e.g. from
-                # as_strided).
-                new_expr = self._transfer_foreign_unbacked_expr(
-                    cast(SymInt, sd),
-                    replacements=old_to_new,
+                stride_source = TensorPropertySource(
+                    source, TensorProperty.STRIDE, i
+                )
+                new_expr = self._transfer_foreign_expr(
+                    cast(SymInt, sd), source=stride_source
                 )
                 new_stride_exprs.append(new_expr)
             else:
                 new_stride_exprs.append(sympy.Integer(sd))
 
-        # 4. Storage offset.  Helper handles the leftover-symbol fallback.
+        # 4. Storage offset.
         if is_symbolic(storage_offset):
-            new_offset_expr = self._transfer_foreign_unbacked_expr(
-                cast(SymInt, storage_offset),
-                replacements=old_to_new,
+            offset_source = TensorPropertySource(
+                source, TensorProperty.STORAGE_OFFSET
+            )
+            new_offset_expr = self._transfer_foreign_expr(
+                cast(SymInt, storage_offset), source=offset_source
             )
         else:
             new_offset_expr = sympy.Integer(storage_offset)
@@ -5592,12 +5564,13 @@ class ShapeEnv:
 
     @record_shapeenv_event()
     def _set_unbacked_var_to_hint_override(self, symint: SymInt, hint: int) -> None:
-        expr = symint.node.expr
-        if not isinstance(expr, sympy.Symbol):
-            raise AssertionError(f"{expr} is not a basic Symbol.")
-        if not self.is_unbacked_symint(expr):
-            raise AssertionError(f"{expr} is not an unbacked SymInt.")
-        self.var_to_hint_override[expr] = hint
+        # Internal-only.  External users should call
+        # torch._dynamo.override_optimization_hint (the public, validated API).
+        # This wrapper exists purely so internal mutations to
+        # var_to_hint_override participate in shape-env event replay via
+        # @record_shapeenv_event().  Callers are responsible for ensuring
+        # symint.node.expr is an unbacked sympy.Symbol.
+        self.var_to_hint_override[symint.node.expr] = hint
 
     def is_unbacked_symint(self, symbol: sympy.Symbol) -> bool:
         """Check if a sympy symbol matches the naming convention for unbacked symbols"""
