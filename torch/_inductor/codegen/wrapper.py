@@ -1759,7 +1759,7 @@ class PythonWrapperCodegen(CodeGen):
     def codegen_input_size_and_nan_asserts(self) -> None:
         if config.size_asserts:
             self.codegen_input_size_asserts()
-        if config.nan_asserts:
+        if config.nan_asserts or config.runtime_triton_nan_asserts:
             self.codegen_input_nan_asserts()
 
     # Input size/stride assertions are deferred from the top of call() to just
@@ -1963,7 +1963,7 @@ class PythonWrapperCodegen(CodeGen):
 
     def generate_return(self, output_refs: list[str]) -> None:
         if output_refs:
-            if config.nan_asserts:
+            if config.nan_asserts or config.runtime_triton_nan_asserts:
                 self.wrapper_call.writeline(
                     "return_vars = (" + ", ".join(output_refs) + ", )"
                 )
