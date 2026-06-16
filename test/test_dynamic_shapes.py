@@ -6292,10 +6292,12 @@ class TestMaybeFastEvalComparison(TestCase):
             {sym: [source]}, lambda source: source.name, {sym: [source]}
         )
 
+        # Printer emits torch.sym_max / torch.sym_min so the printed string is
+        # symbol-safe to eval on unbacked SymInts.
         max_expr = printer.doprint(sympy.Max(1, sym))
         min_expr = printer.doprint(sympy.Min(1, sym))
-        self.assertEqual(max_expr, "max(1, L['u0'])")
-        self.assertEqual(min_expr, "min(1, L['u0'])")
+        self.assertEqual(max_expr, "torch.sym_max(1, L['u0'])")
+        self.assertEqual(min_expr, "torch.sym_min(1, L['u0'])")
 
         locals_ = {"L": {"u0": u0}}
         max_result = eval(max_expr, SYMPY_INTERP, locals_).node.expr  # noqa: P204
@@ -6303,15 +6305,19 @@ class TestMaybeFastEvalComparison(TestCase):
         self.assertEqual(max_result, Max(1, sym))
         self.assertEqual(min_result, Min(1, sym))
 
-        locals_["s1"] = sympy.Integer(2)
-        max_result = eval("max(L['u0'], s1)", SYMPY_INTERP, locals_).node.expr  # noqa: P204
-        min_result = eval("min(L['u0'], s1)", SYMPY_INTERP, locals_).node.expr  # noqa: P204
-        self.assertEqual(max_result, Max(2, sym))
-        self.assertEqual(min_result, Min(2, sym))
-
-        locals_["s2"] = sympy.Integer(3)
-        self.assertEqual(eval("max(s1, s2)", SYMPY_INTERP, locals_), 3)  # noqa: P204
-        self.assertEqual(eval("min(s1, s2)", SYMPY_INTERP, locals_), 2)  # noqa: P204
+        # Three-arg form right-folds into nested binary calls.
+        u1 = shape_env.create_unbacked_symint()
+        sym1 = u1.node.expr
+        printer3 = ShapeGuardPythonPrinter(
+            {sym: [source], sym1: [LocalSource("u1")]},
+            lambda s: s.name,
+            {sym: [source], sym1: [LocalSource("u1")]},
+        )
+        max3 = printer3.doprint(sympy.Max(1, sym, sym1))
+        self.assertIn("torch.sym_max", max3)
+        locals3 = {"L": {"u0": u0, "u1": u1}}
+        max3_result = eval(max3, SYMPY_INTERP, locals3).node.expr  # noqa: P204
+        self.assertEqual(max3_result, Max(1, sym, sym1))
 
     def test_non_zero_rhs_returns_none(self):
         """Test that comparison with non-zero RHS returns None."""
@@ -6707,8 +6713,34 @@ class TestTransferSymbolsFromForeignShapeEnv(TestCase):
         self.assertEqual(local_env.var_to_hint_override[new_u0], 32)
         self.assertEqual(local_env.var_to_hint_override[new_u1], 16)
 
+    def test_raw_unbacked_symint_transfer_falls_back_for_backed_leftover(self):
+        """Mixed backed+unbacked foreign expr falls back to fresh local unbacked."""
+        foreign_env = ShapeEnv()
+        u0 = foreign_env.create_unbacked_symint()
+        # Create a backed foreign symbol that this env cannot translate.
+        s0 = foreign_env.create_symbol(
+            8,
+            self._make_source("s0"),
+            DimDynamic.DYNAMIC,
+        )
+        s0_symint = foreign_env.create_symintnode(s0, hint=8)
+        mixed = u0 + s0_symint
+
+        local_env = ShapeEnv()
+        raw = local_env.transfer_unbacked_symint_from_foreign_shape_env(
+            mixed, source=self._make_source("raw_mixed")
+        )
+
+        # Result is a fresh local unbacked symbol — no foreign symbols leaked.
+        result_expr = raw.node.expr
+        self.assertTrue(local_env.is_unbacked_symint(result_expr))
+        # All free symbols are owned by local_env.
+        for sym in result_expr.free_symbols:
+            self.assertTrue(local_env.is_unbacked_symint(sym))
+
     def test_foreign_unbacked_transfer_preserves_derived_tensor_expr(self):
-        """Tensor and raw SymInt derived expressions share transferred symbols."""
+        """Derived tensor dims are minted as opaque symbols; raw SymInt with
+        the same expression reuses that symbol via the (env, expr) cache."""
         foreign_env = ShapeEnv()
         global_tokens = foreign_env.create_unbacked_symint()
         hidden = foreign_env.create_unbacked_symint()
@@ -6730,8 +6762,10 @@ class TestTransferSymbolsFromForeignShapeEnv(TestCase):
         self.assertEqual(raw_derived_tokens.node.expr, new_sizes[0].node.expr)
         self.assertEqual(new_strides[0].node.expr, new_sizes[1].node.expr)
         self.assertEqual(len(raw_derived_tokens.node.expr.free_symbols), 1)
-        derived_global_tokens = next(iter(raw_derived_tokens.node.expr.free_symbols))
-        self.assertEqual(local_env.var_to_hint_override[derived_global_tokens], 64)
+        derived_token_sym = next(iter(raw_derived_tokens.node.expr.free_symbols))
+        # `derived_tokens` (= global_tokens // 2) is minted as one fresh
+        # opaque symbol; its hint is the foreign expression's hint (64 // 2).
+        self.assertEqual(local_env.var_to_hint_override[derived_token_sym], 32)
         self.assertEqual(local_env.var_to_hint_override[new_sizes[1].node.expr], 128)
 
     def test_foreign_unbacked_transfer_preserves_shared_token_grid(self):

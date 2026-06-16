@@ -1,4 +1,5 @@
 import sys
+from collections.abc import Sequence
 from typing import Literal
 
 import sympy
@@ -257,20 +258,25 @@ class PythonPrinter(ExprPrinter):
         # pyrefly: ignore [missing-attribute]
         return f"abs({self._print(expr.args[0])})"
 
-    # NB: It's expected that we've made explicit any promotion in the sympy
-    # expression, so it doesn't matter that Python max/min doesn't perform
-    # promotion
+    # Use torch.sym_max/sym_min so guards stay symbol-safe on unbacked SymInts.
     def _print_Max(self, expr: sympy.Expr) -> str:
         if len(expr.args) < 2:
             raise AssertionError("Max expects at least two arguments")
         # pyrefly: ignore [missing-attribute]
-        return f"max({', '.join(map(self._print, expr.args))})"
+        return self._fold_binary_call("torch.sym_max", expr.args)
 
     def _print_Min(self, expr: sympy.Expr) -> str:
         if len(expr.args) < 2:
             raise AssertionError("Min expects at least two arguments")
         # pyrefly: ignore [missing-attribute]
-        return f"min({', '.join(map(self._print, expr.args))})"
+        return self._fold_binary_call("torch.sym_min", expr.args)
+
+    def _fold_binary_call(self, fn: str, args: Sequence[sympy.Expr]) -> str:
+        printed = [self._print(a) for a in args]
+        result = printed[-1]
+        for arg in reversed(printed[:-1]):
+            result = f"{fn}({arg}, {result})"
+        return result
 
     def _print_OpaqueUnaryFn_cos(self, expr: sympy.Expr) -> str:
         if len(expr.args) != 1:
