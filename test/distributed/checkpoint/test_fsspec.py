@@ -8,6 +8,7 @@ from typing import Any
 from unittest.mock import patch
 
 import fsspec
+import fsspec.implementations.memory
 
 import torch
 import torch.distributed as dist
