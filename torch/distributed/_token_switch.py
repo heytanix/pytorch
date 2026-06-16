@@ -47,8 +47,14 @@ def _prepare_nccl4py() -> None:
             "`pip install nccl4py==0.3.1`."
         )
     ep_dir = os.path.join(nccl_pkg, "ep")
-    if os.path.isdir(os.path.join(ep_dir, "include", "nccl_ep")):
-        os.environ.setdefault("NCCL_EP_HOME", ep_dir)
+    if "NCCL_EP_HOME" not in os.environ:
+        ep_headers = os.path.join(ep_dir, "include", "nccl_ep")
+        if not os.path.isdir(ep_headers):
+            raise ImportError(
+                f"nccl4py at {nccl_pkg} is missing the EP JIT headers expected "
+                f"at {ep_headers}; reinstall nccl4py or set NCCL_EP_HOME."
+            )
+        os.environ["NCCL_EP_HOME"] = ep_dir
 
     # Point the JIT at NCCL headers. libnccl.so itself needs no preload here: a
     # USE_SYSTEM_NCCL=ON torch (the only build that reaches this path) already

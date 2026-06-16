@@ -495,7 +495,7 @@ if(BUILD_PYTHON AND NOT BUILD_LIBTORCH_WHL)
       # Dynamic: resolve nccl4py's libnccl_ep.so (site-packages/nccl/ep/lib, one
       # dir up from torch/ via $ORIGIN/..) at import.
       set_target_properties(_nccl_ep PROPERTIES
-        INSTALL_RPATH "${_rpath_portable_origin}/lib:${_rpath_portable_origin}/../nccl/ep/lib")
+        INSTALL_RPATH "${_rpath_portable_origin}/lib;${_rpath_portable_origin}/../nccl/ep/lib")
     else()
       # Static: only torch's own libs needed; bake the in-tree JIT header dir so
       # the extension self-configures NCCL_EP_HOME / NCCL_HOME at import.
