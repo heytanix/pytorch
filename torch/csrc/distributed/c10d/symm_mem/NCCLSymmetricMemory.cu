@@ -15,6 +15,7 @@
 
 #include <ATen/ceil_div.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAAllocatorConfig.h>
 #include <c10/cuda/CUDACachingAllocator.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/util/error.h>
@@ -45,6 +46,7 @@ struct NCCLAllocation {
   size_t buffer_size;
   size_t signal_pad_size;
   int device_idx;
+  bool use_caching_allocator_;
   std::mutex mutex;
   // Map of group name to peer alloc info
   ska::flat_hash_map<std::string, c10::intrusive_ptr<NCCLPeerAllocInfo>>
@@ -54,11 +56,13 @@ struct NCCLAllocation {
       void* ptr,
       size_t buffer_size,
       size_t signal_pad_size,
-      int device_idx)
+      int device_idx,
+      bool use_caching_allocator)
       : ptr(ptr),
         buffer_size(buffer_size),
         signal_pad_size(signal_pad_size),
-        device_idx(device_idx) {}
+        device_idx(device_idx),
+        use_caching_allocator_(use_caching_allocator) {}
 
   ~NCCLAllocation() {
     // Avoid calling CUDA functions after driver shutting down
@@ -67,10 +71,14 @@ struct NCCLAllocation {
     }
     c10::cuda::CUDAGuard guard(device_idx);
     // Single free for the combined buffer + signal pad region.
-    ncclResult_t res = ncclMemFree(ptr);
-    if (res != ncclSuccess) {
+    if (use_caching_allocator_) {
+      c10::cuda::CUDACachingAllocator::raw_delete(ptr);
+    } else {
+      ncclResult_t res = ncclMemFree(ptr);
+      if (res != ncclSuccess) {
         LOG(WARNING) << "ncclMemFree failed in NCCLAllocation dtor: "
-                      << ncclGetErrorString(res);
+                     << ncclGetErrorString(res);
+      }
     }
   }
 };
@@ -471,21 +479,31 @@ class NCCLSymmetricMemoryAllocator : public SymmetricMemoryAllocator {
         "must not be called with a group_name");
 
     c10::cuda::CUDAGuard guard(device_idx);
-    // Allocate buffer + signal pad together in a single ncclMemAlloc call.
-    // Buffer occupies [0, size); signal pad starts at round_up(size, 16).
-    // A single window is registered over the whole region at rendezvous
-    // time, so only the base pointer (already granularity-aligned by
-    // ncclMemAlloc) needs to satisfy NCCL's window-alignment requirement.
+    // Allocate buffer + signal pad together in one call. Buffer occupies
+    // [0, size); signal pad starts at round_up(size, 16). A single window is
+    // registered over the whole region at rendezvous time, so only the base
+    // pointer needs to satisfy NCCL's window-alignment requirement.
     const size_t signal_pad_size = get_signal_pad_size();
     const size_t total_size = at::round_up(size, 16UL) + signal_pad_size;
-    void* ptr;
-    C10D_NCCL_CHECK(ncclMemAlloc(&ptr, total_size), "ncclMemAlloc");
+    const bool use_caching_allocator =
+        c10::cuda::CUDACachingAllocator::CUDAAllocatorConfig::
+            expandable_segments();
+    void* ptr = nullptr;
+    if (use_caching_allocator) {
+      ptr = c10::cuda::CUDACachingAllocator::raw_alloc(total_size);
+      TORCH_CHECK(
+          ptr != nullptr,
+          "NCCLSymmetricMemoryAllocator::alloc: raw_alloc failed for size ",
+          total_size);
+    } else {
+      C10D_NCCL_CHECK(ncclMemAlloc(&ptr, total_size), "ncclMemAlloc");
+    }
     {
       std::lock_guard<std::mutex> lock(mutex_);
       allocations_.emplace(
           ptr,
           std::make_unique<NCCLAllocation>(
-              ptr, size, signal_pad_size, device_idx));
+              ptr, size, signal_pad_size, device_idx, use_caching_allocator));
     }
     return ptr;
   }

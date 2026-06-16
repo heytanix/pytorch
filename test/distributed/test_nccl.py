@@ -289,6 +289,45 @@ class NCCLSymmetricMemoryTest(MultiProcContinuousTest):
         out = symm_mem.empty(numel, dtype=dtype, device=self.device)
         symm_mem.rendezvous(out, group=group_name)
 
+    @skip_but_pass_in_sandcastle_if(
+        TEST_WITH_ROCM, "expandable_segments is not supported on ROCm"
+    )
+    @skip_but_pass_in_sandcastle_if(IS_WINDOWS, "NCCL doesn't support Windows")
+    @requires_nccl_version((2, 27), "NCCL Symmetric Memory support from nccl 2.27")
+    @skip_if_lt_x_gpu(2)
+    def test_nccl_symmem_alloc_expandable_segments(self):
+        torch.cuda.memory._set_allocator_settings("expandable_segments:True")
+        try:
+            settings = torch.cuda.memory._snapshot()["allocator_settings"]
+            if not settings["expandable_segments"]:
+                self.skipTest("expandable_segments is not supported on this platform")
+
+            symm_mem.set_backend("NCCL")
+            torch.cuda.set_device(self.rank)
+            c10d.all_reduce(torch.ones(1, device=self.device))
+            group_name = c10d.group.WORLD.group_name
+
+            dtype = torch.float
+            numel = 1024
+
+            inp = symm_mem.empty(numel, dtype=dtype, device=self.device)
+            symm_mem.rendezvous(inp, group=group_name)
+
+            out = symm_mem.empty(numel, dtype=dtype, device=self.device)
+            symm_mem.rendezvous(out, group=group_name)
+
+            result = torch.ops.symm_mem.one_shot_all_reduce(
+                inp.fill_(self.rank), "sum", group_name
+            )
+            self.assertEqual(
+                result,
+                torch.full_like(
+                    result, (self.world_size - 1) * self.world_size / 2
+                ),
+            )
+        finally:
+            torch.cuda.memory._set_allocator_settings("expandable_segments:False")
+
     @skip_but_pass_in_sandcastle_if(TEST_WITH_ROCM, "Skip NCCL tests for ROCm")
     @skip_but_pass_in_sandcastle_if(IS_WINDOWS, "NCCL doesn't support Windows")
     @requires_nccl_version((2, 27), "NCCL Symmetric Memory support from nccl 2.27")
