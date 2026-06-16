@@ -228,50 +228,25 @@ class TestCostModel(DTensorOpTestBase):
         self.assertEqual(redistribute_cost(replica_spec, strided_shard_spec), 0.0)
 
     def test_redistribute_cost_latency(self):
-        # test cost model on addmm op
-        from torch.distributed.tensor._ops._matrix_ops import addmm_strategy
+        mesh = DeviceMesh("cpu", torch.arange(self.world_size))
+        torch.manual_seed(0)
+        bias = torch.randn(8)
+        mat1 = torch.randn(50, 6)
+        mat2 = torch.randn(6, 8)
 
-        mesh = self.build_device_mesh()
-        shard0_placement = (Shard(0),)
-        partial_placement = (Partial(),)
-        shard1_placement = (Shard(1),)
-
-        shard0_tensor_meta = extract_tensor_meta(torch.randn(8))
-        partial_tensor_meta = extract_tensor_meta(torch.randn(50, 6))
-        shard1_tensor_meta = extract_tensor_meta(torch.randn(6, 8))
-
-        # shard spec
-        shard0_spec = DTensorSpec(mesh, shard0_placement, shard0_tensor_meta)
-        # replica spec
-        partial_spec = DTensorSpec(mesh, partial_placement, partial_tensor_meta)
-        # partial spec
-        shard1_spec = DTensorSpec(mesh, shard1_placement, shard1_tensor_meta)
-
-        op_schema = OpSchema(
-            torch.ops.aten.addmm.default,
-            (
-                OpStrategy([OpSpec(shard0_spec)]),
-                OpStrategy([OpSpec(partial_spec)]),
-                OpStrategy([OpSpec(shard1_spec)]),
-            ),
-            {},
+        dist_bias = distribute_tensor(bias, mesh, [Shard(0)])
+        dist_mat1 = DTensor.from_local(
+            mat1 / self.world_size,
+            mesh,
+            [Partial()],
+            run_check=False,
         )
+        dist_mat2 = distribute_tensor(mat2, mesh, [Shard(1)])
 
-        output_strategy = addmm_strategy(op_schema)
-        strategy_costs = {}
-        for strategy in output_strategy.strategies:
-            redistribute_cost = sum(chain.from_iterable(strategy.redistribute_cost))
-            strategy_costs[str(strategy)] = redistribute_cost
+        dist_out = torch.addmm(dist_bias, dist_mat1, dist_mat2)
 
-        # assert that cost model counts for collective latency (i.e. multiple comm is penalized)
-        self.assertTrue(
-            strategy_costs["(S(0), R, S(1)) -> S(1)"]
-            < strategy_costs["(R, S(0), R) -> S(0)"]
-        )
-        # assert a single allreduce is the best one
-        self.assertEqual(
-            strategy_costs["(S(0), R, S(1)) -> S(1)"], min(strategy_costs.values())
-        )
+        self.assertEqual(dist_out.placements, (Shard(1),))
+        self.assertEqual(dist_out.full_tensor(), torch.addmm(bias, mat1, mat2))
 
     def test_redistribute_cost_mesh_2d(self):
         mesh_2d = DeviceMesh(
@@ -306,8 +281,6 @@ class TestCostModel(DTensorOpTestBase):
         self.assertTrue(allreduce_cost > reduce_scatter_cost)
 
     def test_mm_strategies(self):
-        from torch.distributed.tensor._ops._matrix_ops import mm_strategy
-
         mesh = self.build_device_mesh()
         lhs_tensor = torch.randn(6, 8)
         rhs_tensor = torch.randn(8, 12)
@@ -326,22 +299,6 @@ class TestCostModel(DTensorOpTestBase):
 
             op_schema = OpSchema(
                 torch.ops.aten.mm.default,
-                (
-                    OpStrategy([OpSpec(lhs_spec)]),
-                    OpStrategy([OpSpec(rhs_spec)]),
-                ),
-                {},
-            )
-            # test the strategy
-            res_strategies = mm_strategy(op_schema)
-
-            for strtgy in res_strategies.strategies:
-                if strtgy.input_specs == (lhs_spec, rhs_spec):
-                    self.assertEqual(strtgy.redistribute_cost, [[0.0], [0.0]])
-                    break
-
-            op_schema = OpSchema(
-                torch.ops.aten.mm.default,
                 (lhs_spec, rhs_spec),
                 {},
             )
@@ -351,9 +308,59 @@ class TestCostModel(DTensorOpTestBase):
             )
             self.assertFalse(output_sharding.needs_redistribute)
 
-    def test_bmm_strategies(self):
-        from torch.distributed.tensor._ops._matrix_ops import bmm_strategy
+    def test_t_prunes_unproven_unbacked_strided_shard_candidates(self):
+        from torch._subclasses.fake_tensor import FakeTensorMode
+        from torch.distributed.tensor._ops.utils import is_tensor_shardable
+        from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
+        mesh = DeviceMesh("cpu", torch.arange(2), _init_backend=False, _rank=0)
+        fake_mode = FakeTensorMode(allow_non_fake_inputs=True, shape_env=ShapeEnv())
+        strategy_info = (
+            DTensor._op_dispatcher.sharding_propagator.op_single_dim_strategy_funcs[
+                torch.ops.aten.t.default
+            ]
+        )
+        self.assertFalse(strategy_info.allow_unbacked_sharding)
+
+        with fake_mode:
+            split_factor = fake_mode.shape_env.create_unbacked_symint()
+            torch._dynamo.override_optimization_hint(split_factor, 8)
+            input_meta = TensorMeta(
+                torch.Size([2048 * split_factor, 8]),
+                (8, 1),
+                torch.float32,
+            )
+
+            unproven_input_spec = DTensorSpec(
+                mesh,
+                (_StridedShard(1, split_factor=split_factor),),
+                input_meta,
+            )
+            self.assertFalse(
+                is_tensor_shardable(
+                    input_meta.shape,
+                    unproven_input_spec,
+                    allow_unbacked_sharding=strategy_info.allow_unbacked_sharding,
+                )
+            )
+
+            input_spec = DTensorSpec(
+                mesh,
+                (_StridedShard(0, split_factor=split_factor),),
+                input_meta,
+            )
+            op_schema = OpSchema(torch.ops.aten.t.default, (input_spec,), {})
+            output_sharding = DTensor._op_dispatcher.sharding_propagator.propagate_op_sharding_non_cached(
+                op_schema
+            )
+
+        self.assertFalse(output_sharding.needs_redistribute)
+        self.assertEqual(
+            output_sharding.output_spec.placements,
+            (_StridedShard(1, split_factor=split_factor),),
+        )
+
+    def test_bmm_strategies(self):
         mesh = self.build_device_mesh()
         lhs_tensor = torch.randn(8, 6, 8)
         rhs_tensor = torch.randn(8, 8, 12)
@@ -370,22 +377,6 @@ class TestCostModel(DTensorOpTestBase):
         for lhs, rhs in bmm_combs:
             lhs_spec = DTensorSpec(mesh, (lhs,), lhs_tensor_meta)
             rhs_spec = DTensorSpec(mesh, (rhs,), rhs_tensor_meta)
-
-            op_schema = OpSchema(
-                torch.ops.aten.bmm.default,
-                (
-                    OpStrategy([OpSpec(lhs_spec)]),
-                    OpStrategy([OpSpec(rhs_spec)]),
-                ),
-                {},
-            )
-            # test the strategy
-            res_strategies = bmm_strategy(op_schema)
-
-            for strtgy in res_strategies.strategies:
-                if strtgy.input_specs == (lhs_spec, rhs_spec):
-                    self.assertEqual(strtgy.redistribute_cost, [[0.0], [0.0]])
-                    break
 
             op_schema = OpSchema(
                 torch.ops.aten.bmm.default,
@@ -912,6 +903,42 @@ class TestOpSchemaMetaProperties(TestCase):
         self.assertEqual(values_plc.dim, 0)
         self.assertEqual(indices_plc.dim, 0)
         self.assertEqual(input_plc.dim, 1)
+
+    def test_var_mean_single_dim_strategy(self):
+        from torch.distributed.tensor._ops._math_ops import std_var_single_dim_strategy
+
+        input_meta = TensorMeta(
+            shape=torch.Size([8, 4]), stride=(4, 1), dtype=torch.float32
+        )
+        output_meta = TensorMeta(
+            shape=torch.Size([8]), stride=(1,), dtype=torch.float32
+        )
+
+        strategies = std_var_single_dim_strategy(
+            torch.ops.aten.var_mean.correction,
+            (input_meta, [1]),
+            {},
+        )
+        self.assertEqual(len(strategies), 1)
+        self.assertEqual(len(strategies[0]), 3)
+        var_out, mean_out, inp = strategies[0]
+        self.assertEqual(var_out.dim, 0)
+        self.assertEqual(mean_out.dim, 0)
+        self.assertEqual(inp.dim, 0)
+
+        strategies = std_var_single_dim_strategy(
+            torch.ops.aten.var_mean.correction_out,
+            (input_meta, [1]),
+            {"out0": output_meta, "out1": output_meta},
+        )
+        self.assertEqual(len(strategies), 1)
+        self.assertEqual(len(strategies[0]), 5)
+        var_out, mean_out, inp, out0, out1 = strategies[0]
+        self.assertEqual(var_out.dim, 0)
+        self.assertEqual(mean_out.dim, 0)
+        self.assertEqual(inp.dim, 0)
+        self.assertEqual(out0.dim, 0)
+        self.assertEqual(out1.dim, 0)
 
     def test_layer_norm_fwd_single_dim_strategy(self):
         """layer_norm produces sharding rules for each outer dim."""
