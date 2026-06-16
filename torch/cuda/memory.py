@@ -1436,12 +1436,25 @@ def _use_uvm(device: "Device" = None):
                 _advise_uses_struct = False
         return _runtime.cudaMemAdvise(ptr, size, advice, device_id)
 
+    def _device_supports_uvm_advice(device_id, _runtime=_rt):
+        attr = getattr(
+            _runtime.cudaDeviceAttr, "cudaDevAttrConcurrentManagedAccess", None
+        )
+        if attr is None:
+            return True
+        result = _runtime.cudaDeviceGetAttribute(attr, device_id)
+        err = result if not isinstance(result, tuple) else result[0]
+        if err != _runtime.cudaError_t.cudaSuccess:
+            return False
+        supported = result[1]
+        return bool(supported)
+
     def _uvm_alloc(size, device, stream, _runtime=_rt):
         try:
             err, ptr = _runtime.cudaMallocManaged(size, _runtime.cudaMemAttachGlobal)
             _check(err, f"cudaMallocManaged({size})")
             ptr = int(ptr)
-            if device >= 0:
+            if device >= 0 and _device_supports_uvm_advice(device):
                 _check(
                     _mem_advise(
                         ptr,
