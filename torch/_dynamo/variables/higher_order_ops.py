@@ -3398,49 +3398,46 @@ class MapHigherOrderVariable(TorchHigherOrderOperatorVariable):
             [br for bm, br in zip(none_mask, body_r_vars) if not bm]
         )
 
-        # Mutation handling: map allows in-place writes only to pos_args
-        # (lifted, loop-invariant tensors). Mutations of xs are unsafe
-        # (see MapImpl.gen_schema for the contract) so we graph-break here
-        # with a precise message. The remaining indices are mapped through
-        # the parent-side input list to produce a comma-joined
-        # ``mutated_arg_indices`` kwarg for the HOP call, mirroring
-        # scan / while_loop.
+        # Mutation handling: map allows in-place writes only to xs
+        # (each iteration sees a storage-disjoint slice). Mutations of
+        # pos_args are unsafe (see MapImpl.gen_schema for the contract)
+        # so we graph-break here with a precise message. The remaining
+        # indices are mapped through the parent-side input list to produce
+        # a comma-joined ``mutated_arg_indices`` kwarg for the HOP call,
+        # mirroring scan / while_loop.
         n_xs = len(unpacked_xs)
 
-        xs_mutated = sorted(i for i in body_mutated_inputs if i < n_xs)
-        if xs_mutated:
+        pos_args_mutated = sorted(i - n_xs for i in body_mutated_inputs if i >= n_xs)
+        if pos_args_mutated:
             unimplemented(
-                gb_type="torch.map: f mutates xs",
-                context=f"xs={xs_mutated}",
+                gb_type="torch.map: f mutates pos_args",
+                context=f"pos_args={pos_args_mutated}",
                 explanation=(
-                    "map only supports in-place mutation of pos_args "
-                    "(loop-invariant tensors). xs[t] is a fresh, storage-"
-                    "disjoint slice each step, so a mutation cannot be "
-                    "observed by any other iteration. The only externally-"
-                    "observable effect of mutating xs[t] is a write-back to "
-                    "xs's t-th slice, which is already expressible via the "
-                    "f return value. For in-place lifted buffers, pass them "
-                    "via pos_args."
+                    "map only supports in-place mutation of xs (each "
+                    "iteration sees a storage-disjoint slice). pos_args "
+                    "are loop-invariant: every iteration sees the same "
+                    "tensor, so a mutation makes iterations depend on each "
+                    "other, breaking map's independence contract and "
+                    "introducing a data race under any parallel lowering. "
+                    "Use scan or while_loop if sequential buffer updates "
+                    "are required."
                 ),
                 hints=[
                     *graph_break_hints.USER_ERROR,
                 ],
             )
 
-        # pos_args (subgraph indices [n_xs, ...)) plus any lifted freevars
-        # (indices >= n_xs + n_pos_args). Both are carried as pos_args at
-        # the HOP-call layer.
+        # Build a parent-storage set from the xs subgraph placeholders that
+        # were detected as mutated, then re-map through ``all_map_inputs``
+        # to recover the parent-side indices. Lifted freevars are appended
+        # so storage matching also covers any captured-tensor that aliases
+        # an xs slice's storage.
         all_map_inputs: list[VariableTracker | Proxy] = (
-            list(unpacked_xs)
-            + list(unpacked_args)
-            + list(body_lifted_freevars)
+            list(unpacked_xs) + list(unpacked_args) + list(body_lifted_freevars)
         )
-        # Build a parent-storage set from the subgraph placeholders that were
-        # detected as mutated, then re-map through ``all_map_inputs`` so we
-        # cover both regular pos_args and lifted freevars.
         mutated_input_storages = subgraph_mutated_input_storages(
             body_graph,
-            {i for i in body_mutated_inputs if i >= n_xs},
+            {i for i in body_mutated_inputs if i < n_xs},
         )
         mutated_inputs = parent_mutated_input_indices(
             all_map_inputs, mutated_input_storages

@@ -69,17 +69,17 @@ class MapImpl(HigherOrderOperator):
         body_gm = materialize_as_graph(f, all_inputs)
 
         # Mutation semantics for map:
-        # - pos_args is mutable: lifted, loop-invariant tensors (e.g. module
-        #   buffers, KV caches), same semantics as scan's additional_inputs
-        #   and while_loop's additional_inputs. Mutations are surfaced via
-        #   auto_functionalize_v2 so the parent graph sees them.
-        # - xs is NOT mutable: each iteration sees a fresh, storage-disjoint
-        #   slice (xs[t] and xs[t+1] share no storage), so a mutation on
-        #   xs[t] cannot be observed by any other iteration. The only
-        #   externally-observable effect is "write-back to xs's t-th slice",
-        #   which is already expressible via the output path at no extra
-        #   cost. If xs-like in-place updates are required, pass the buffer
-        #   via pos_args and index into it inside f.
+        # - xs is mutable: each iteration sees a storage-disjoint slice
+        #   (xs[t] and xs[t+1] share no storage), so in-place writes are
+        #   race-free regardless of evaluation order, preserving map's
+        #   "iterations are independent" contract. Mutations are surfaced
+        #   via auto_functionalize_v2 so the parent graph sees them.
+        # - pos_args is NOT mutable: every iteration sees the same tensor,
+        #   so mutating it makes iterations depend on each other, breaking
+        #   the independence contract and introducing a data race under any
+        #   parallel lowering. Users who need a shared mutable buffer
+        #   should use scan / while_loop, where sequential iteration is
+        #   part of the contract.
         outputs = get_graph_output_example_values(body_gm)
         mutated_set = (
             {int(i) for i in mutated_arg_indices.split(",") if i}
@@ -91,15 +91,10 @@ class MapImpl(HigherOrderOperator):
         schema_gen.add_arg("f", body_gm)
 
         for idx, x in enumerate(xs):
-            schema_gen.add_arg(f"xs{idx}", x)
+            schema_gen.add_arg(f"xs{idx}", x, is_mutated=idx in mutated_set)
 
-        offset = len(xs)
         for idx, arg in enumerate(pos_args):
-            schema_gen.add_arg(
-                f"additional_input{idx}",
-                arg,
-                is_mutated=(offset + idx) in mutated_set,
-            )
+            schema_gen.add_arg(f"additional_input{idx}", arg)
 
         for out in outputs:
             schema_gen.add_output(out)

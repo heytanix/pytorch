@@ -10409,20 +10409,14 @@ class <lambda>(torch.nn.Module):
 
     @skipIfTorchDynamo()
     @parametrize("dynamic", [True, False])
-    def test_map_auto_functionalize_buffer_mutation(self, dynamic):
+    def test_map_auto_functionalize_xs_mutation(self, dynamic):
         device = "cpu"
 
         class M(torch.nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.register_buffer(
-                    "buf", torch.ones(4, requires_grad=False, device=device)
-                )
-
             def forward(self, xs):
                 def body_fn(x):
-                    self.buf.add_(x)
-                    return x * 2 + self.buf.sum()
+                    x.add_(1)
+                    return x * 2 + x.sum()
 
                 return control_flow.map(body_fn, xs)
 
@@ -10434,52 +10428,50 @@ class <lambda>(torch.nn.Module):
 
     @skipIfTorchDynamo()
     @parametrize("dynamic", [True, False])
-    def test_map_auto_functionalize_multiple_buffer_mutation(self, dynamic):
+    def test_map_auto_functionalize_multiple_xs_mutation(self, dynamic):
         device = "cpu"
 
         class M(torch.nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.register_buffer("buf1", torch.ones(4, device=device))
-                self.register_buffer("buf2", torch.zeros(4, device=device))
+            def forward(self, xs1, xs2):
+                def body_fn(xs):
+                    x1, x2 = xs
+                    x1.add_(1)
+                    x2.sub_(1)
+                    return x1 + x2, x1 * x2
 
-            def forward(self, xs):
-                def body_fn(x):
-                    self.buf1.add_(x)
-                    self.buf2.add_(self.buf1)
-                    return x * 2
+                return control_flow.map(body_fn, (xs1, xs2))
 
-                return control_flow.map(body_fn, xs)
-
-        xs = torch.arange(20, dtype=torch.float32).reshape(5, 4)
-        fw_gm = self._check_eager_and_aot_eager_only(M, (xs,), device, dynamic)
+        xs1 = torch.arange(20, dtype=torch.float32).reshape(5, 4)
+        xs2 = torch.arange(20, dtype=torch.float32).reshape(5, 4) + 100
+        fw_gm = self._check_eager_and_aot_eager_only(M, (xs1, xs2), device, dynamic)
         graph_str = fw_gm.print_readable(print_output=False)
         self.assertIn("auto_functionalized_v2", graph_str)
 
-    @skipIfTorchDynamo()
-    @parametrize("dynamic", [True, False])
-    def test_map_auto_functionalize_captured_tensor_mutation(self, dynamic):
-        device = "cpu"
-
-        class M(torch.nn.Module):
-            def forward(self, xs, y):
-                def body_fn(x):
-                    y.add_(-1)
-                    return x * 2 + y.sum()
-
-                out = control_flow.map(body_fn, xs)
-                return out + y.sum()
-
-        xs = torch.arange(20, dtype=torch.float32).reshape(5, 4)
-        y = torch.ones(4, requires_grad=False)
-        fw_gm = self._check_eager_and_aot_eager_only(M, (xs, y), device, dynamic)
-        graph_str = fw_gm.print_readable(print_output=False)
-        self.assertIn("auto_functionalized_v2", graph_str)
-
-    def test_map_xs_mutation_graph_breaks(self):
-        def body_fn(x):
-            x.add_(1)  # mutating xs[t] is disallowed
+    def test_map_pos_args_mutation_graph_breaks(self):
+        def body_fn(x, buf):
+            buf.add_(x)  # mutating pos_args is disallowed
             return x * 2
+
+        xs = torch.arange(20, dtype=torch.float32).reshape(5, 4)
+        buf = torch.zeros(4)
+
+        def fn(xs, buf):
+            return control_flow.map(body_fn, xs, buf)
+
+        torch._dynamo.reset()
+        with torch.no_grad():
+            with self.assertRaisesRegex(
+                torch._dynamo.exc.UncapturedHigherOrderOpError,
+                r"Higher Order Operator: torch\.ops\.higher_order\.map_impl",
+            ):
+                torch.compile(fn, backend="eager", fullgraph=True)(xs, buf)
+
+    def test_map_captured_tensor_mutation_graph_breaks(self):
+        y = torch.ones(4)
+
+        def body_fn(x):
+            y.add_(-1)  # mutating a captured (loop-invariant) tensor is disallowed
+            return x * 2 + y.sum()
 
         xs = torch.arange(20, dtype=torch.float32).reshape(5, 4)
 
@@ -10496,42 +10488,42 @@ class <lambda>(torch.nn.Module):
 
     @skipIfTorchDynamo()
     @parametrize("dynamic", [True, False])
-    def test_map_auto_functionalize_partial_buffer_mutation(self, dynamic):
+    def test_map_auto_functionalize_partial_xs_mutation(self, dynamic):
         device = "cpu"
 
         class M(torch.nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.register_buffer("buf0", torch.zeros(4, device=device))
-                self.register_buffer("buf1", torch.zeros(4, device=device))
-                self.register_buffer("buf2", torch.zeros(4, device=device))
+            def forward(self, xs0, xs1, xs2):
+                def body_fn(xs):
+                    x0, x1, x2 = xs
+                    # Skip x1 to make a non-contiguous mutation set.
+                    x0.add_(1)
+                    x2.add_(1)
+                    return x0 * 2 + x1.sum() + x2.sum()
 
-            def forward(self, xs):
-                def body_fn(x):
-                    # Skip buf1 to make non-contiguous mutation set.
-                    self.buf0.add_(x)
-                    self.buf2.add_(x)
-                    return x * 2 + self.buf1.sum()
+                return control_flow.map(body_fn, (xs0, xs1, xs2))
 
-                return control_flow.map(body_fn, xs)
-
-        xs = torch.arange(20, dtype=torch.float32).reshape(5, 4)
-        fw_gm = self._check_eager_and_aot_eager_only(M, (xs,), device, dynamic)
+        xs0 = torch.zeros(5, 4)
+        xs1 = torch.zeros(5, 4)
+        xs2 = torch.zeros(5, 4)
+        fw_gm = self._check_eager_and_aot_eager_only(
+            M, (xs0, xs1, xs2), device, dynamic
+        )
         graph_str = fw_gm.print_readable(print_output=False)
         self.assertIn("auto_functionalized_v2", graph_str)
 
-    def test_map_eager_xs_mutation_raises(self):
-        def body_fn(x):
-            x.add_(1)
+    def test_map_eager_pos_args_mutation_raises(self):
+        def body_fn(x, buf):
+            buf.add_(x)
             return x * 2
 
         xs = torch.arange(20, dtype=torch.float32).reshape(5, 4)
+        buf = torch.zeros(4)
 
         with self.assertRaisesRegex(
             torch._dynamo.exc.UncapturedHigherOrderOpError,
             r"Higher Order Operator: torch\.ops\.higher_order\.map_impl",
         ):
-            control_flow.map(body_fn, xs)
+            control_flow.map(body_fn, xs, buf)
 
 
 _hop_schema_test_schema_types = [
@@ -10942,35 +10934,35 @@ class TestHopSchema(TestCase):
         )
 
     def test_map_gen_schema_with_mutated_arg_indices_kwarg(self):
-        def body_fn(x, buf0, buf1):
+        def body_fn(x):
             return x * 2
 
         schema = torch.ops.higher_order.map_impl.gen_schema(
             body_fn,
             (torch.randn(5, 3, 4),),
-            (torch.randn(3, 4), torch.randn(3, 4)),
-            "2",
+            (),
+            "0",
         )
         self.assertExpectedInline(
             str(schema),
-            """map_impl(Any f, Tensor xs0, Tensor additional_input0, Tensor(a3!) additional_input1) -> ((Tensor))""",
+            """map_impl(Any f, Tensor(a1!) xs0) -> ((Tensor))""",
         )
 
-    def test_map_gen_schema_multiple_pos_args_mutation_via_kwarg(self):
-        def body_fn(x, b0, b1, b2):
-            b1.add_(x)
-            b2.add_(x)
-            return x * 2
+    def test_map_gen_schema_multiple_xs_mutation_via_kwarg(self):
+        def body_fn(x0, x1, x2):
+            x0.add_(1)
+            x2.add_(1)
+            return x0 + x1 + x2
 
         schema = torch.ops.higher_order.map_impl.gen_schema(
             body_fn,
-            (torch.randn(5, 3, 4),),
-            (torch.randn(3, 4), torch.randn(3, 4), torch.randn(3, 4)),
-            "2,3",
+            (torch.randn(5, 3, 4), torch.randn(5, 3, 4), torch.randn(5, 3, 4)),
+            (),
+            "0,2",
         )
         self.assertExpectedInline(
             str(schema),
-            """map_impl(Any f, Tensor xs0, Tensor additional_input0, Tensor(a3!) additional_input1, Tensor(a4!) additional_input2) -> ((Tensor))""",
+            """map_impl(Any f, Tensor(a1!) xs0, Tensor xs1, Tensor(a3!) xs2) -> ((Tensor))""",
         )
 
 
