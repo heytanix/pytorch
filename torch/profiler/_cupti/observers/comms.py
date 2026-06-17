@@ -167,7 +167,7 @@ class CommsObserver(CuptiMonitorObserver):
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._name_filter = kernel_name_filter
-        self._resolver = metadata_resolver
+        self._meta_resolver = metadata_resolver
         self._event_resolver = event_resolver
         # Quiescence (stall) detection: when a timeout is set the observer runs its own
         # background thread that drains on a cadence and -- if no lifecycle callback has
@@ -354,7 +354,7 @@ class CommsObserver(CuptiMonitorObserver):
         collectives' on_end (E). Like the event resolver, the anchor populates it only
         after capture/finalize, so a caller that built the observer before then wires it
         here."""
-        self._resolver = fn
+        self._meta_resolver = fn
 
     def set_wait_source(self, drain: Callable[[], list[int]]) -> None:
         """Set the CPU-wait source -- the comms hook's :meth:`CommMonitorHook.drain_waits`
@@ -488,7 +488,7 @@ class CommsObserver(CuptiMonitorObserver):
                 self._in_flight[int(eid)] = _parse(blob)
         completed: list[CommRecord] = []
         for timed in self.drain_collectives(flush=flush):
-            record = _join_record(timed, self._in_flight, self._resolver)
+            record = _join_record(timed, self._in_flight, self._meta_resolver)
             eid = int(timed["external_id"])
             gnode = int(timed["graph_node_id"])
             # Schedule-before-end: a collective issued and completed in the same poll

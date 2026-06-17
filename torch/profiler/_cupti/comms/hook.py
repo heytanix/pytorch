@@ -50,7 +50,7 @@ from torch.profiler._cupti.utils.graph_nodes import HAVE_NODE_TOOLS_ID, remap_to
 try:
     from cuda.bindings import runtime as _rt  # pyrefly: ignore[missing-import]
 except ImportError:
-    _rt = None  # type: ignore[assignment]
+    _rt: Any = None
 
 
 logger = logging.getLogger(__name__)
