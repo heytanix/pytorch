@@ -958,6 +958,81 @@ Relevance score: 78.5.
 
 ### G23: List Init
 
+Status: FIXED (Cycle 3). Classification (a): genuine in-scope object-protocol
+bug in `ListVariable.__init__`. Source fix landed in the working tree
+(uncommitted); target sentinel removed. No collateral sentinels.
+
+Root cause: `ListVariable.call_method` already had a `__init__` branch, but it
+did NOT mirror CPython `list___init___impl` (Objects/listobject.c). For
+`len(args) == 0` it returned `None` WITHOUT clearing the list, so
+`a.__init__()` on `[1, 2, 3]` left the list unchanged and
+`assertEqual(a, [])` failed (the `AssertionError` surfaced as an
+`Unsupported`/graph-break inside the polyfilled `assertEqual`). The
+`len(args) == 1` branch replaced contents via slice assignment (fine for
+overwrite) but `len(args) > 1` fell through to `super().call_method` with no
+arg-count validation.
+
+Fix: rewrote the branch to mirror CPython `list___init___impl` -- clear the
+list, then extend with the optional iterable arg. Routes the extend through
+the existing `extend` `call_method` (reusing CPython `list.extend`
+fast-path logic) rather than duplicating unpack logic. Validates 0-or-1 args
+and 0 kwargs via `raise_args_mismatch`, matching the sibling list-method
+branches and the G19 deque `__init__` pattern.
+
+Files changed:
+- `torch/_dynamo/variables/lists.py` (`ListVariable.call_method` `__init__`
+  branch)
+- `test/dynamo/test_sequence_ops.py` (`TestSqConcat`:
+  `test_list_reinit_clears`, `test_list_reinit_overwrites`,
+  `test_list_reinit_from_iterable`, `test_list_reinit_too_many_args`;
+  `TestRangeUserIndex.test_list_reinit_fullgraph`)
+
+Sentinel removed (working tree, uncommitted):
+- `CPython313-test_list-ListTest.test_init` (target)
+
+No collateral sentinels: there is no `test_userlist-...test_init` sentinel
+(UserList shares the same `list_tests.CommonTest.test_init` but already
+passed), tuples are immutable, and `test_deque-TestBasic.test_init` is a
+separate deque path covered by G19.
+
+Exact commands run and results (current tree):
+
+```bash
+# Target test, sentinel removed -> PASS
+CUDA_VISIBLE_DEVICES= PYTORCH_TESTING_DEVICE_ONLY_FOR=cpu PYTORCH_TEST_WITH_DYNAMO=1 \
+  python test/cpython/v3_13/test_list.py ListTest.test_init
+# OK (1 test)
+
+# Whole affected CPython file -> PASS
+CUDA_VISIBLE_DEVICES= PYTORCH_TESTING_DEVICE_ONLY_FOR=cpu PYTORCH_TEST_WITH_DYNAMO=1 \
+  python test/cpython/v3_13/test_list.py
+# Ran 65 tests, OK (skipped=14); no failures, no XPASS
+
+# New regression tests -> PASS
+CUDA_VISIBLE_DEVICES= PYTORCH_TESTING_DEVICE_ONLY_FOR=cpu \
+  python test/dynamo/test_sequence_ops.py -k list_reinit
+# Ran 5 tests, OK
+
+# Full sequence_ops suite -> PASS
+CUDA_VISIBLE_DEVICES= PYTORCH_TESTING_DEVICE_ONLY_FOR=cpu \
+  python test/dynamo/test_sequence_ops.py
+# Ran 135 tests, OK (expected failures=2, pre-existing)
+
+# Nearby Dynamo suite sanity -> PASS
+CUDA_VISIBLE_DEVICES= PYTORCH_TESTING_DEVICE_ONLY_FOR=cpu \
+  python test/dynamo/test_functions.py
+# Ran 523 tests, OK (skipped=8, expected failures=2)
+```
+
+Risks: low. The extend route reuses the established CPython-mirroring
+`list.extend` path; behavior on a single iterable arg is unchanged for the
+common case and now additionally clears-first (matching CPython, which is a
+no-op for the prior slice-assignment when extend appends to an emptied list).
+
+Next gate: G24.
+
+Original gate scaffolding preserved below.
+
 Target sentinel:
 
 ```
@@ -984,6 +1059,110 @@ torch/_dynamo/variables/builtin.py
 
 ### G24: Dict Splittable Pop
 
+Status: FIXED (Cycle 3). Classification (a): genuine in-scope observable dict
+ordering bug in `obj.__dict__` mutation tracking. NOT a split-table internals
+problem -- the "splittable" framing is a CPython implementation detail; the
+observable thing the test checks is dict insertion-order semantics after a
+pop + re-add. Source fix landed in the working tree (uncommitted); target
+sentinel removed. No collateral sentinels.
+
+Root cause: `obj.__dict__` key order is observable via `list(obj.__dict__)`.
+Dynamo tracks instance-dict mutations in `SideEffects.store_attr_mutations`
+(an insertion-ordered dict) and `DunderDictVariable`/`SideEffectsProxyDict`
+iterate over it to produce `__dict__` order. When a key was popped
+(`store_instance_dict_attr` stores a `DeletedVariable`) and then re-added
+(`d[k] = v`), the re-store reused the key's ORIGINAL slot in
+`store_attr_mutations` (re-assigning an existing dict key preserves its
+position). So for a `C.__dict__` built in-graph from `o.x,o.y,o.z=1,2,3`, then
+`o.__dict__.pop('y')` then `o.__dict__['y']=42`, Dynamo produced
+`['x','y','z']` while CPython gives `['x','z','y']` (CPython appends a
+re-inserted key at the end). The whole test method is compiled with
+`error_on_graph_break=True` and `enable_trace_load_build_class=True` (set by
+`CPythonTestCase.setUpClass`), so the local `class C` builds in-graph and all
+attributes live in the side effects table (`item_dict` empty); the wrong order
+surfaced at `self.assertEqual(list(a), ['x', 'z', 'y'])` (test_dict.py:1141) as
+`ObservedAssertionErrorError -> Unsupported: Observed exception`.
+
+Fix: in `SideEffects.store_instance_dict_attr`, when storing a non-delete value
+for a key whose current side-effects entry is a `DeletedVariable`, drop that
+stale (deleted) entry from `store_attr_mutations[item]` (and its
+`attr_mutation_kinds`) before re-storing, so the new value re-inserts at the
+end of the insertion-ordered dict. This mirrors CPython dict re-insertion
+ordering and is scoped to INSTANCE_DICT mutations (the only attribute mutations
+whose order is user-observable); generic object setattr is unaffected.
+
+Files changed:
+- `torch/_dynamo/side_effects.py` (`store_instance_dict_attr`)
+- `test/dynamo/test_dicts.py` (`DunderDictVariableTests`:
+  `test_dunder_dict_pop_reinsert_order`,
+  `test_dunder_dict_pop_missing_raises_keyerror`,
+  `test_dunder_dict_pop_default`; all `fullgraph=True`)
+
+Sentinel removed (working tree, uncommitted):
+- `CPython313-test_dict-DictTest.test_splittable_pop` (target)
+
+No collateral sentinels. The sibling split-table tests still fail on other,
+out-of-scope blockers and their sentinels are LEFT IN PLACE (verified failing
+with sentinel removed):
+- `test_splittable_del` (FAILED -- separate del/sizeof path)
+- `test_splittable_popitem` (FAILED -- popitem + sizeof)
+- `test_splittable_setdefault` (FAILED -- setdefault ordering + sizeof)
+- `test_splittable_to_generic_combinedtable` (FAILED -- combined-table internals)
+- `test_splittable_update` has no sentinel and already passes (not collateral).
+
+Scope note: a separate, PRE-EXISTING (present on the clean tree, NOT introduced
+by this fix) ordering bug remains for the sourced-object case -- popping then
+re-adding a key that originally lived in the real `obj.__dict__` (so it is in
+`SideEffectsProxyDict.item_dict`, not the side-effects table). There
+`SideEffectsProxyDict.__iter__` yields side-effects-table keys before
+`item_dict` keys, so a re-added original key sorts to the front instead of the
+end. That path is not exercised by this target test (the test builds dicts
+fresh in-graph, `item_dict` empty) and fixing it cleanly needs explicit
+instance-dict order state on `SideEffects`; deferred as out of scope for this
+gate.
+
+Exact commands run and results (current tree):
+
+```bash
+# Target test, sentinel removed -> PASS
+CUDA_VISIBLE_DEVICES= PYTORCH_TESTING_DEVICE_ONLY_FOR=cpu PYTORCH_TEST_WITH_DYNAMO=1 \
+  python test/cpython/v3_13/test_dict.py DictTest.test_splittable_pop
+# OK (1 test)
+
+# Whole affected CPython file -> PASS
+CUDA_VISIBLE_DEVICES= PYTORCH_TESTING_DEVICE_ONLY_FOR=cpu PYTORCH_TEST_WITH_DYNAMO=1 \
+  python test/cpython/v3_13/test_dict.py
+# Ran 112 tests, OK (skipped=42); no failures, no XPASS
+# (benign "Exception ignored in __del__" noise from test_store_evilattr,
+#  unrelated to this change)
+
+# New regression tests -> PASS
+CUDA_VISIBLE_DEVICES= PYTORCH_TESTING_DEVICE_ONLY_FOR=cpu \
+  python test/dynamo/test_dicts.py DunderDictVariableTests
+# Ran 11 tests, OK
+
+# Nearby Dynamo suites sanity -> PASS
+CUDA_VISIBLE_DEVICES= PYTORCH_TESTING_DEVICE_ONLY_FOR=cpu \
+  python test/dynamo/test_dicts.py
+# Ran 304 tests, OK (expected failures=1)
+CUDA_VISIBLE_DEVICES= PYTORCH_TESTING_DEVICE_ONLY_FOR=cpu \
+  python test/dynamo/test_modules.py
+# Ran 139 tests, OK
+CUDA_VISIBLE_DEVICES= PYTORCH_TESTING_DEVICE_ONLY_FOR=cpu \
+  python test/dynamo/test_functions.py
+# Ran 523 tests, OK (skipped=8, expected failures=2)
+```
+
+Risks: low. The fix only adjusts ordering for instance-dict keys that were
+deleted and re-added (a delete must have stored a `DeletedVariable` first), and
+is gated on the existing entry being a `DeletedVariable`, so it never touches
+plain overwrite-in-place ordering or generic (non-`__dict__`) attribute
+mutation. `lintrunner` clean on the two changed source files.
+
+Next gate: G25.
+
+Original gate scaffolding preserved below.
+
 Target sentinel:
 
 ```
@@ -1008,6 +1187,135 @@ torch/_dynamo/variables/builtin.py
 ```
 
 ### G25: Sort Bad Decorator
+
+Status: FIXED (Cycle 3). Classification (a): two genuine in-scope
+object-protocol gaps. Source fix landed in the working tree (uncommitted);
+target sentinel removed (already deleted in the tree at session start) plus one
+verified collateral sentinel removed. No commit.
+
+Root cause: the test does
+`self.assertRaises(TypeError, data.sort, key=lambda x,y: 0)` where `data =
+'...'.split()`. CPython `list.sort` calls `key(item)` with a single argument;
+a two-arg key raises `TypeError`, and the test asserts that. Two separate
+Dynamo gaps blocked it:
+
+1. Argument-binding mismatches were graph breaks, not observed exceptions.
+   Calling a traced Python function with the wrong arity raises `TypeError` in
+   `bind_args`/`bind_args_cached` (CPython would raise `TypeError` at call
+   time), but the inline path (`symbolic_convert.py:_inline_call`) converted
+   that `TypeError` into an `Unsupported` "failed to bind arguments" graph
+   break (gb7312, `USER_ERROR`). So `list.sort`'s internal `key(x)` call (and
+   any wrong-arity call) could not propagate a catchable `TypeError`.
+2. `str.split()` returned an immutable list. `ConstantVariable.call_method`
+   wrapped str-method results via `ConstantVariable.create(...)`, which builds
+   a `ListVariable` with no `mutation_type` (immutable). So `data.sort()` on a
+   `.split()` result fell through `ListVariable.call_method`'s
+   `name == "sort" and self.is_mutable()` guard to `super().call_method` ->
+   "Unsupported method call `sort`", before the key was ever called. CPython
+   `str.split` returns a fresh, caller-owned mutable list.
+
+Fix:
+- `torch/_dynamo/variables/functions.py`: new `ArgumentBindingError(TypeError)`
+  marker raised by `bind_args_cached` (the four signature-mismatch sites) and
+  by `NestedUserFunctionVariable.bind_args` (wrapping the
+  `inspect.signature(...).bind` `TypeError`). A plain `TypeError` raised
+  elsewhere in binding (e.g. the internal "Only supports regular Python
+  functions" limitation) is intentionally NOT marked, so it still graph-breaks.
+- `torch/_dynamo/symbolic_convert.py`: the inline path catches
+  `ArgumentBindingError` before the generic `TypeError`/graph-break and routes
+  it through `exc.raise_observed_exception(TypeError, ...)` with a CPython-like
+  `"<name>() <detail>"` message, so user code catching `TypeError` behaves like
+  eager. The non-marked `TypeError` path is unchanged.
+- `torch/_dynamo/variables/constant.py`: when a `str` method returns a `list`
+  (split/rsplit/splitlines), build a new mutable `ListVariable`
+  (`ValueMutationNew()`) instead of an immutable one, mirroring CPython's
+  fresh caller-owned list.
+
+Files changed:
+- `torch/_dynamo/variables/functions.py`
+- `torch/_dynamo/symbolic_convert.py`
+- `torch/_dynamo/variables/constant.py`
+- `test/dynamo/test_functions.py` (new `ArgumentBindingTests` with 6 tests:
+  missing/extra positional, unexpected keyword, list.sort bad key,
+  str.split-returns-mutable-list, str.split + cmp_to_key; plus rewrote
+  `DefaultsTests.test_unsupported_msg_in_bind_args_error` into
+  `test_bind_args_mismatch_raises_typeerror` because that test asserted the OLD
+  graph-break behavior that is now an observed `TypeError`).
+
+Sentinels removed (working tree, uncommitted):
+- `CPython313-test_sort-TestDecorateSortUndecorate.test_baddecorator` (target;
+  was already deleted in the tree at session start, kept removed).
+- `CPython313-test_sort-TestDecorateSortUndecorate.test_decorated` (collateral;
+  verified XPASS only because of the `str.split()` mutable-list fix -- it does
+  `data = '...'.split(); data.sort(key=str.lower)` and
+  `copy.sort(key=cmp_to_key(my_cmp))`). Verified passing with sentinel removed.
+
+Repro evidence before fix (target test under Dynamo):
+`torch._dynamo.exc.Unsupported: Unsupported method call ... method 'sort' of
+class 'list' ... call_method ListVariable(length=9) sort [] {'key':
+NestedUserFunctionVariable()}`. Isolated probes confirmed both blockers: a
+2-arg lambda called with 1 arg gave gb7312 "failed to bind arguments"; a
+`"...".split()` list reached `sort` as a non-mutable `ListVariable`.
+
+Exact commands run and results (current tree):
+
+```bash
+# Target test under Dynamo, sentinel removed -> PASS
+CUDA_VISIBLE_DEVICES= PYTORCH_TESTING_DEVICE_ONLY_FOR=cpu PYTORCH_TEST_WITH_DYNAMO=1 \
+  python test/cpython/v3_13/test_sort.py TestDecorateSortUndecorate.test_baddecorator
+# OK (1 test)
+
+# Whole affected CPython file under Dynamo -> PASS, no XPASS
+CUDA_VISIBLE_DEVICES= PYTORCH_TESTING_DEVICE_ONLY_FOR=cpu PYTORCH_TEST_WITH_DYNAMO=1 \
+  python test/cpython/v3_13/test_sort.py
+# Ran 21 tests, OK (skipped=14)
+
+# New + updated regression tests -> PASS
+CUDA_VISIBLE_DEVICES= PYTORCH_TESTING_DEVICE_ONLY_FOR=cpu \
+  python test/dynamo/test_functions.py ArgumentBindingTests \
+  DefaultsTests.test_bind_args_mismatch_raises_typeerror
+# Ran 7 tests, OK
+
+# Nearby Dynamo suites sanity -> PASS
+CUDA_VISIBLE_DEVICES= PYTORCH_TESTING_DEVICE_ONLY_FOR=cpu \
+  python test/dynamo/test_functions.py
+# Ran 529 tests, OK (skipped=8, expected failures=2)
+CUDA_VISIBLE_DEVICES= PYTORCH_TESTING_DEVICE_ONLY_FOR=cpu \
+  python test/dynamo/test_sequence_ops.py
+# Ran 137 tests, OK (expected failures=2)
+CUDA_VISIBLE_DEVICES= PYTORCH_TESTING_DEVICE_ONLY_FOR=cpu \
+  python test/dynamo/test_misc.py
+# Ran 765 tests, OK (skipped=12, expected failures=4)
+CUDA_VISIBLE_DEVICES= PYTORCH_TESTING_DEVICE_ONLY_FOR=cpu \
+  python test/dynamo/test_exceptions.py
+# Ran 76 tests, OK
+CUDA_VISIBLE_DEVICES= PYTORCH_TESTING_DEVICE_ONLY_FOR=cpu \
+  python test/dynamo/test_decorators.py
+# Ran 83 tests, OK (skipped=2)
+CUDA_VISIBLE_DEVICES= PYTORCH_TESTING_DEVICE_ONLY_FOR=cpu PYTORCH_TEST_WITH_DYNAMO=1 \
+  python test/cpython/v3_13/test_list.py
+# Ran 65 tests, OK (skipped=14)
+```
+
+`test/dynamo/test_repros.py` has 2 ERRORS
+(`test_linalg_inv_singular_aot_eager_raises`,
+`test_linalg_inv_check_errors_preserved_in_aot_graph`) but both are
+PRE-EXISTING environment failures ("requires compiling PyTorch with LAPACK";
+this is the CPU-only build), unrelated to this change.
+
+Risks: the argument-binding change is the broad one -- it converts wrong-arity
+inline calls from a graph break to a propagating observed `TypeError`. This is
+strictly more CPython-faithful (eager raises `TypeError` in exactly those
+cases) and is scoped to genuine signature mismatches via the
+`ArgumentBindingError` marker, leaving internal-limitation `TypeError`s as
+graph breaks. The one fallout was `test_unsupported_msg_in_bind_args_error`,
+which asserted the old behavior and was rewritten accordingly. The
+`str.split` change is strictly more permissive (immutable -> mutable fresh
+list). `lintrunner` clean on all four changed files.
+
+Next gate: G26.
+
+Original gate scaffolding preserved below.
 
 Target sentinel:
 
@@ -1034,6 +1342,85 @@ torch/_dynamo/variables/user_defined.py
 ```
 
 ### G26: Dict Views Mapping
+
+Status: FIXED (Cycle 3). Classification (a): genuine in-scope object-protocol
+gap. CPython exposes a read-only `mapping` attribute on dict_keys/dict_values/
+dict_items via the `dictview_mapping` getset descriptor
+(Objects/dictobject.c), returning a `mappingproxy` of the underlying dict.
+Dynamo had no `var_getattr` for `.mapping` on `DictViewVariable`, so
+`d.keys().mapping` produced a generic `GetAttrVariable(DictKeysVariable(),
+mapping)`; `isinstance(that, mappingproxy)` then graph-broke with
+"builtin isinstance() cannot determine type of argument" (gb0175). Source fix
+landed in the working tree (uncommitted); target sentinel removed. No
+collateral sentinels.
+
+Confirmed failure before change (current tree, sentinel removed):
+
+```
+torch._dynamo.exc.Unsupported: builtin isinstance() cannot determine type of
+argument. Dynamo doesn't have a rule to determine the type of argument
+GetAttrVariable(DictKeysVariable(), mapping); isinstance(
+GetAttrVariable(DictKeysVariable(), mapping),
+UserDefinedClassVariable(<class 'mappingproxy'>)). From user code at
+test_dict.py:178 (self.assertIsInstance(m, mappingproxy)).
+```
+
+Root cause: `DictViewVariable` had no `var_getattr` override; `.mapping` fell
+through to the base hook, which builds a `GetAttrVariable`. `isinstance` over
+a `GetAttrVariable` has no type rule.
+
+Fix: added `DictViewVariable.var_getattr` returning
+`MappingProxyVariable(self.dv_dict)` for `name == "mapping"` (delegating other
+names to `super().var_getattr`). `MappingProxyVariable` already models
+`types.MappingProxyType` correctly (python_type, isinstance, richcompare,
+mutation-reflection through the shared `dv_dict` VT), so `isinstance(m,
+mappingproxy)` and `m == d` work, and a later `d["foo"]="bar"` is reflected
+through the live proxy. This routes through the existing mappingproxy model
+rather than a local spot fix.
+
+Files changed:
+- `torch/_dynamo/variables/dicts.py` (`DictViewVariable.var_getattr`)
+- `test/dynamo/test_dicts.py` (`DictTests.test_dict_view_mapping`,
+  `DictTests.test_dict_view_mapping_reflects_mutation`; both `fullgraph=True`)
+
+Sentinel removed (working tree, uncommitted):
+- `CPython313-test_dict-DictTest.test_views_mapping` (target)
+
+Exact commands run and results (current tree):
+
+```bash
+# Target test, sentinel removed -> PASS
+CUDA_VISIBLE_DEVICES= PYTORCH_TESTING_DEVICE_ONLY_FOR=cpu PYTORCH_TEST_WITH_DYNAMO=1 \
+  python test/cpython/v3_13/test_dict.py DictTest.test_views_mapping
+# OK (1 test)
+
+# Whole affected CPython file -> PASS
+CUDA_VISIBLE_DEVICES= PYTORCH_TESTING_DEVICE_ONLY_FOR=cpu PYTORCH_TEST_WITH_DYNAMO=1 \
+  python test/cpython/v3_13/test_dict.py
+# Ran 112 tests, OK (skipped=41); no failures, no XPASS
+# (benign "Exception ignored in __del__" noise from test_store_evilattr,
+#  unrelated to this change)
+
+# New regression tests -> PASS
+CUDA_VISIBLE_DEVICES= PYTORCH_TESTING_DEVICE_ONLY_FOR=cpu \
+  python test/dynamo/test_dicts.py DictTests.test_dict_view_mapping \
+  DictTests.test_dict_view_mapping_reflects_mutation
+# Ran 2 tests, OK
+
+# Nearby Dynamo suite sanity -> PASS
+CUDA_VISIBLE_DEVICES= PYTORCH_TESTING_DEVICE_ONLY_FOR=cpu \
+  python test/dynamo/test_dicts.py
+# Ran 306 tests, OK (expected failures=1, pre-existing)
+```
+
+Risks: low. The change only adds a single attribute name (`mapping`) on dict
+views, returning the already-modeled `MappingProxyVariable`; all other getattr
+names are unchanged (delegated to super). `lintrunner` clean on both changed
+files.
+
+Next gate: G27.
+
+Original gate scaffolding preserved below.
 
 Target sentinel:
 
@@ -1062,6 +1449,116 @@ torch/_dynamo/variables/user_defined.py
 
 ### G27: Dict Non-Str Single-Instance Setitem
 
+Status: FIXED (Cycle 3). Classification (a): genuine in-scope object-protocol
+gap. CPython's instance `__dict__` accepts arbitrary hashable keys when set via
+the mapping API (only attribute access via setattr/getattribute requires str);
+this is NOT the split/combined-table internals (those are an implementation
+detail per CPYTHON_MIRRORING.md "what not to mirror"). The observable behavior
+the test checks -- `f.__dict__[1] = 1` succeeds and `list(f.__dict__)` reflects
+it -- was wrongly rejected by Dynamo. Source fix landed in the working tree
+(uncommitted); target sentinel removed plus one verified collateral sentinel.
+
+Confirmed failure before change (current tree, sentinel removed):
+
+```
+AssertionError: Expected str key, got <class 'int'>
+  File ".../torch/_dynamo/variables/dicts.py", line 1535, in __setitem__
+    raise AssertionError(f"Expected str key, got {type(name)}")
+from user code at test_dict.py:1324 (f.__dict__[1] = 1).
+```
+
+Root cause: `SideEffectsProxyDict.__setitem__` (`dicts.py`) asserted the
+instance-dict key was a `str`. Instance-`__dict__` mutations are tracked in
+`SideEffects.store_attr_mutations[item]` (an insertion-ordered dict keyed by the
+attribute name) and, crucially, are REPLAYED via
+`object_setattr_ignore_descriptor(obj, name, value)` (`utils.py`), which does a
+plain `obj.__dict__[name] = value` -- NOT `STORE_ATTR`. So a non-str key is fine
+end-to-end: the side-effects table, `has_pending_mutation_of_attr`, `load_attr`,
+`__iter__` (wraps each key in `ConstantVariable.create`), and the codegen replay
+are all dict-key-generic; only the `__setitem__` str assertion (a holdover from
+the str-only attribute model) blocked it. The `str` type annotations on the
+side-effects attr APIs are inaccurate but harmless at runtime.
+
+Fix: dropped the str-only assertion in `SideEffectsProxyDict.__setitem__`. The
+key is still unwrapped via `_maybe_unwrap_key` (which calls
+`HashableTracker.vt.as_python_constant()`, so a non-constant key already raises
+and graph-breaks upstream), so only python-constant keys reach
+`store_instance_dict_attr`. This is scoped to instance-`__dict__` item
+assignment; the separate wholesale `obj.__dict__ = {...}` replacement path
+(`get_value___dict__`) still enforces str keys (it materializes via a different
+path) and is unchanged.
+
+Note: this is distinct from the wholesale-replacement non-str rejection in
+`get_value___dict__` (GENERIC_SETATTR of `__dict__`), which is a different,
+out-of-scope path not exercised by this test.
+
+Files changed:
+- `torch/_dynamo/variables/dicts.py` (`SideEffectsProxyDict.__setitem__`)
+- `test/dynamo/test_dicts.py` (`DunderDictVariableTests`:
+  `test_dunder_dict_non_str_key_setitem`,
+  `test_dunder_dict_non_str_key_roundtrip`; both `fullgraph=True`)
+
+Sentinels removed (working tree, uncommitted), each verified failing-before
+(`Expected str key, got <class 'int'>`) / passing-after:
+- `CPython313-test_dict-DictTest.test_object_set_item_single_instance_non_str_key`
+  (target)
+- `CPython313-test_dict-DictTest.test_splittable_to_generic_combinedtable`
+  (collateral -- `d[2] = 2` on an instance dict hits the identical
+  `__setitem__` str assertion; the "combined-table" framing is the same
+  observable non-str-instance-dict-key behavior, NOT table internals).
+
+Collateral NOT removed (verified still FAILING on other, out-of-scope blockers
+with their sentinels removed -- left in place):
+- `test_splittable_del` (sys.getsizeof / del path)
+- `test_splittable_popitem` (sys.getsizeof + popitem)
+- `test_splittable_setdefault` (sys.getsizeof + setdefault ordering)
+
+G29/G30 (`test_reentrant_insertion`, `test_str_nonstr`) sentinels left untouched
+(unrelated closure-cell / `__del__` reentrancy blockers; not made to XPASS by
+this fix).
+
+Exact commands run and results (current tree):
+
+```bash
+# Target test under Dynamo, sentinel removed -> PASS
+CUDA_VISIBLE_DEVICES= PYTORCH_TESTING_DEVICE_ONLY_FOR=cpu PYTORCH_TEST_WITH_DYNAMO=1 \
+  python test/cpython/v3_13/test_dict.py DictTest.test_object_set_item_single_instance_non_str_key
+# OK (1 test)
+
+# Collateral test, sentinel removed -> PASS
+CUDA_VISIBLE_DEVICES= PYTORCH_TESTING_DEVICE_ONLY_FOR=cpu PYTORCH_TEST_WITH_DYNAMO=1 \
+  python test/cpython/v3_13/test_dict.py DictTest.test_splittable_to_generic_combinedtable
+# OK (1 test)
+
+# Whole affected CPython file -> PASS, no failures/XPASS
+CUDA_VISIBLE_DEVICES= PYTORCH_TESTING_DEVICE_ONLY_FOR=cpu PYTORCH_TEST_WITH_DYNAMO=1 \
+  python test/cpython/v3_13/test_dict.py
+# Ran 112 tests, OK (skipped=39)
+# (benign "Exception ignored in __del__" noise from test_store_evilattr,
+#  unrelated to this change)
+
+# New regression tests -> PASS
+CUDA_VISIBLE_DEVICES= PYTORCH_TESTING_DEVICE_ONLY_FOR=cpu \
+  python test/dynamo/test_dicts.py \
+  DunderDictVariableTests.test_dunder_dict_non_str_key_setitem \
+  DunderDictVariableTests.test_dunder_dict_non_str_key_roundtrip
+# Ran 2 tests, OK
+
+# Nearby Dynamo suite sanity -> PASS
+CUDA_VISIBLE_DEVICES= PYTORCH_TESTING_DEVICE_ONLY_FOR=cpu \
+  python test/dynamo/test_dicts.py
+# Ran 308 tests, OK (expected failures=1, pre-existing)
+```
+
+Risks: low. The change only removes an over-strict assertion on a path whose
+replay (`object_setattr_ignore_descriptor` -> plain `__dict__[name] = value`)
+already supports arbitrary hashable keys. Non-constant keys still graph-break
+upstream in `_maybe_unwrap_key`. `lintrunner` clean on both changed files.
+
+Next gate: G28.
+
+Original gate scaffolding preserved below.
+
 Target sentinel:
 
 ```
@@ -1087,6 +1584,148 @@ torch/_dynamo/variables/builtin.py
 ```
 
 ### G28: Deque Subclass Basics
+
+Status: FIXED (Cycle 3). Classification (a): genuine in-scope object-protocol
+gap in user-defined `collections.deque` subclass construction. NOT a
+build-class / closure-cell problem -- the local `class Deque(deque)` traces
+fine (the failure is `UserDefinedClassVariable(Deque)` already exists), the gap
+is purely modeling construction + the inherited deque C-slot ops on the
+subclass instance. Source fix landed in the working tree (uncommitted); target
+sentinel removed plus 3 verified collateral sentinels. No commit.
+
+Root cause: three places in Dynamo's user-defined-object construction path knew
+about `list`/`dict`/`set`/`tuple` subclasses but not `collections.deque`
+subclasses:
+
+1. `SideEffects.cls_supports_mutation_side_effects` (`side_effects.py`)
+   allowlists each builtin container's `__getattribute__` slot wrapper.
+   `deque.__getattribute__` is its own C slot wrapper (NOT
+   `object.__getattribute__`), so a deque subclass failed the check and
+   `UserDefinedClassVariable.call_function` fell through to
+   `super().call_function` -> "Unsupported function call" on
+   `Deque(range(25))`.
+2. `UserDefinedClassVariable.supported_c_new_functions` (`user_defined.py`) did
+   not list `deque.__new__`, so the `instantiate_user_defined_class_object`
+   polyfill's `cls.__new__(cls, ...)` (which resolves to `deque.__new__`) was
+   not a supported tp_new for side-effect-tracked construction.
+3. `SideEffects.get_variable_cls` had no deque-subclass branch, so a constructed
+   deque subclass would have been a plain `UserDefinedObjectVariable` with no
+   deque `_base_vt` to delegate the inherited C-slot methods to.
+
+Fix (mirrors the existing `UserDefinedListVariable` pattern):
+- Added `deque_methods` (callables in `collections.deque.__dict__`) in
+  `utils.py`, the deque analog of `list_methods`/`tuple_methods`.
+- Added `UserDefinedDequeVariable(UserDefinedObjectVariable)` in
+  `user_defined.py`, backed by a `DequeVariable` `_base_vt` with
+  `_base_methods = deque_methods`. The existing `UserDefinedObjectVariable`
+  `_base_vt` delegation machinery (call_method, tp_iter, sq_contains, len, etc.)
+  then routes the inherited deque ops to `DequeVariable`, which already has the
+  CPython-faithful append/appendleft/pop/popleft/extend/__init__/iter behavior
+  from G19. Exported it in `variables/__init__.py`.
+- Added `collections.deque.__getattribute__` to
+  `cls_supports_mutation_side_effects`, `collections.deque.__new__` to
+  `supported_c_new_functions` (and to the init_args-ignored set alongside
+  dict/set in the `__new__` branch, since deque tp_new takes no construction
+  args), and a `issubclass(user_cls, collections.deque)` branch to
+  `get_variable_cls` returning `UserDefinedDequeVariable`.
+
+The polyfill does `cls.__new__(cls)` (empty subclass instance via
+`deque.__new__`) then `obj.__init__(iterable)`, which delegates to
+`DequeVariable.__init__` (clear-then-extend, the G19 path).
+
+Files changed:
+- `torch/_dynamo/utils.py` (`deque_methods`)
+- `torch/_dynamo/variables/user_defined.py` (`UserDefinedDequeVariable`,
+  `supported_c_new_functions`, `__new__` init-args branch, `deque_methods`
+  import)
+- `torch/_dynamo/variables/__init__.py` (export `UserDefinedDequeVariable`)
+- `torch/_dynamo/side_effects.py` (`cls_supports_mutation_side_effects`,
+  `get_variable_cls`)
+- `test/dynamo/test_sequence_ops.py` (new `TestDequeSubclass`:
+  `test_construct_and_basic_ops`, `test_reinit_clears_and_extends`,
+  `test_pop_popleft_clear`, `test_construct_empty`, `test_iterate`, all
+  `fullgraph=True`; also un-`expectedFailure`-d
+  `TestSqConcat.test_user_defined_deque_concat`, which the same fix makes pass)
+
+Sentinels removed (working tree, uncommitted):
+- `CPython313-test_deque-TestSubclass.test_basics` (target)
+- `CPython313-test_deque-TestSubclass.test_strange_subclass` (collateral:
+  `class X(deque)` construction)
+- `CPython313-test_deque-TestSequence.test_addmul` (collateral: builds
+  `class subclass(deque)`)
+- `CPython313-test_deque-TestSequence.test_getitemoverwriteiter` (collateral:
+  builds `class T(deque)` with a `__getitem__` override)
+
+Collateral XPASS (test/dynamo, NOT a CPython sentinel): the
+`@unittest.expectedFailure` on `TestSqConcat.test_user_defined_deque_concat`
+was removed (it now passes -- deque subclass `+` works). Its sibling
+`test_user_defined_deque_inplace_concat` still expected-fails on a separate
+deque `sq_inplace_concat` "Observed exception" path (out of scope; left
+`expectedFailure`).
+
+Repro evidence (current tree, sentinel temporarily removed before fix):
+
+```
+torch._dynamo.exc.Unsupported: Unsupported function call
+  Explanation: Dynamo does not know how to trace the function
+  `<class '__main__.Deque'>`
+  Developer debug context: call_function
+  UserDefinedClassVariable(<class '__main__.Deque'>) [RangeVariable()] {}
+from user code: test/cpython/v3_13/test_deque.py:848 in test_basics
+  d = Deque(range(25))
+```
+
+Exact commands run and results (current tree):
+
+```bash
+# Target test, sentinel removed -> PASS
+CUDA_VISIBLE_DEVICES= PYTORCH_TESTING_DEVICE_ONLY_FOR=cpu PYTORCH_TEST_WITH_DYNAMO=1 \
+  python test/cpython/v3_13/test_deque.py TestSubclass.test_basics
+# OK (1 test)
+
+# Whole affected CPython file, 4 sentinels removed -> PASS
+CUDA_VISIBLE_DEVICES= PYTORCH_TESTING_DEVICE_ONLY_FOR=cpu PYTORCH_TEST_WITH_DYNAMO=1 \
+  python test/cpython/v3_13/test_deque.py
+# Ran 78 tests, OK (skipped=41); no failures, no XPASS
+
+# New regression tests -> PASS
+CUDA_VISIBLE_DEVICES= PYTORCH_TESTING_DEVICE_ONLY_FOR=cpu \
+  python test/dynamo/test_sequence_ops.py TestDequeSubclass
+# Ran 5 tests, OK
+
+# Full sequence_ops suite -> PASS
+CUDA_VISIBLE_DEVICES= PYTORCH_TESTING_DEVICE_ONLY_FOR=cpu \
+  python test/dynamo/test_sequence_ops.py
+# Ran 142 tests, OK (expected failures=1, the inplace-concat path)
+
+# Nearby Dynamo suites sanity -> PASS
+CUDA_VISIBLE_DEVICES= PYTORCH_TESTING_DEVICE_ONLY_FOR=cpu \
+  python test/dynamo/test_functions.py   # Ran 529, OK (skipped=8, xfail=2)
+  python test/dynamo/test_modules.py     # Ran 139, OK
+  python test/dynamo/test_dicts.py       # Ran 308, OK (xfail=1)
+  python test/dynamo/test_sets.py        # Ran 176, OK (skipped=1)
+
+# List/tuple subclass paths unaffected by the cls_supports_mutation change
+CUDA_VISIBLE_DEVICES= PYTORCH_TESTING_DEVICE_ONLY_FOR=cpu PYTORCH_TEST_WITH_DYNAMO=1 \
+  python test/cpython/v3_13/test_list.py     # Ran 65, OK (skipped=14)
+```
+
+Risk note: `test/cpython/v3_13/test_userlist.py` shows 16 "Unexpected success"
+XPASS errors, but these are PRE-EXISTING (verified by `git stash`-ing the G28
+source changes and re-running -- still 16 errors on the clean tree). `UserList`
+is a `MutableSequence`, not a deque subclass, so it is unrelated to this gate;
+those sentinels are LEFT IN PLACE for a separate gate.
+
+Risks: low. The four construction-path edits are each a one-line addition that
+extends an existing builtin-container allowlist/branch to include
+`collections.deque`; the new `UserDefinedDequeVariable` reuses the established
+`_base_vt`/`_base_methods` delegation already proven for list/tuple/dict/set
+subclasses, and the deque behavior itself is the already-landed G19
+`DequeVariable`. `lintrunner` clean on all changed source files.
+
+Next gate: G29.
+
+Original gate scaffolding preserved below.
 
 Target sentinel:
 
@@ -1141,6 +1780,81 @@ torch/_dynamo/symbolic_convert.py
 torch/_dynamo/variables/user_defined.py
 ```
 
+#### G29 verdict: DEFERRED (low-relevance build-class / source-backed closure-cell)
+
+Triaged and deferred under the agent_manager.md "Low-Relevance Early Exit" rule.
+No source change. Sentinel left in place. Only this Markdown file is modified.
+
+Exact repro command:
+
+```bash
+CUDA_VISIBLE_DEVICES= PYTORCH_TESTING_DEVICE_ONLY_FOR=cpu PYTORCH_TEST_WITH_DYNAMO=1 \
+TORCHDYNAMO_VERBOSE=1 python test/cpython/v3_13/test_dict.py \
+  DictTest.test_reentrant_insertion
+```
+
+Exact failure (abbreviated traceback):
+
+```
+torch._dynamo.exc.Unsupported: Read uninitialized cell
+  Explanation: Attempted to read a cell variable that has not been populated yet.
+  Developer debug context: CellVariable()
+  gb0091
+
+from user code:
+   File ".../test/cpython/v3_13/test_dict.py", line 1344, in test_reentrant_insertion
+    self.check_reentrant_insertion(mutate)
+   File ".../test/cpython/v3_13/test_dict.py", line 1332, in check_reentrant_insertion
+    class Mutating:
+
+# Dynamo internal frames:
+  builtin.py:1855 call___build_class__
+    fn = args[0].get_function(allow_sourced_cells=True)
+  functions.py:1973 _get_function_impl
+    cell_contents = tx.output.side_effects.load_cell(cell_var)
+  side_effects.py:541 load_cell -> unimplemented("Read uninitialized cell")
+```
+
+Root-cause classification: OUT-OF-SCOPE build-class / source-backed closure-cell,
+NOT an in-scope reentrant-dict-insertion semantic gap.
+
+The test helper `check_reentrant_insertion` (lines 1328-1338) defines a *local*
+class inside a method:
+
+```python
+def check_reentrant_insertion(self, mutate):
+    class Mutating:
+        def __del__(self):
+            mutate(d)          # free vars: mutate, d
+    d = {k: Mutating() for k in 'abcdefghijklmnopqr'}   # d assigned AFTER class def
+    for k in list(d):
+        d[k] = k
+```
+
+The `class Mutating` body closes over the free variables `mutate` and `d`. Dynamo
+routes `__build_class__` through `call___build_class__`, which calls
+`get_function(allow_sourced_cells=True)`. Building the class function requires
+loading its closure cells via `side_effects.load_cell`. The cell for `d` has not
+been populated at the point the class is constructed (`d` is bound on the line
+*after* the class definition, while the `__del__` closure captures it), so
+`load_cell` raises "Read uninitialized cell". This is the deferred-G3
+class-body closure-cell construction pattern: making the gate pass would require
+source-backed `__build_class__` closure / local class construction machinery,
+which the early-exit rule places out of scope absent explicit human approval.
+
+This is corroborated by the same test file: the sibling tests
+`DictTest.test_merge_and_mutate` and `DictTest.test_equal_operator_modifying_operand`
+are already guarded with
+`@unittest.skipIf(TEST_WITH_TORCHDYNAMO, "__build_class__ with closed over objects not supported")`,
+confirming closed-over local classes are a known unsupported class here, not a
+dict-insertion semantics gap. The reentrant-insertion behavior itself
+(`__del__` mutating the dict during item replacement) is never reached because
+tracing fails at class construction.
+
+DEFERRED. No `torch/_dynamo` source change attempted. Sentinel
+`CPython313-test_dict-DictTest.test_reentrant_insertion` left in place. Working
+tree ends with only `coverage.md` modified.
+
 ### G30: Dict Str/Non-Str Key
 
 Target sentinel:
@@ -1167,6 +1881,78 @@ torch/_dynamo/variables/dicts.py
 torch/_dynamo/symbolic_convert.py
 torch/_dynamo/variables/user_defined.py
 ```
+
+#### G30 verdict: DEFERRED (low-relevance build-class / source-backed closure-cell)
+
+Triaged and deferred under the agent_manager.md "Low-Relevance Early Exit" rule,
+same root cause as deferred G29. No source change. Sentinel left in place. Only
+this Markdown file is modified.
+
+Exact repro command (current G27-inclusive tree, sentinel temporarily moved):
+
+```bash
+CUDA_VISIBLE_DEVICES= PYTORCH_TESTING_DEVICE_ONLY_FOR=cpu PYTORCH_TEST_WITH_DYNAMO=1 \
+TORCHDYNAMO_VERBOSE=1 python test/cpython/v3_13/test_dict.py \
+  DictTest.test_str_nonstr
+```
+
+Exact failure (abbreviated traceback):
+
+```
+torch._dynamo.exc.Unsupported: Read uninitialized cell
+  Explanation: Attempted to read a cell variable that has not been populated yet.
+  Developer debug context: CellVariable()
+  gb0091
+
+from user code:
+   File ".../test/cpython/v3_13/test_dict.py", line 1626, in test_str_nonstr
+    class Key3:
+
+# Dynamo internal frames:
+  builtin.py:1855 call___build_class__
+    fn = args[0].get_function(allow_sourced_cells=True)
+  functions.py:1973 _get_function_impl
+    cell_contents = tx.output.side_effects.load_cell(cell_var)
+  side_effects.py:541 load_cell -> unimplemented("Read uninitialized cell")
+```
+
+Root-cause classification: OUT-OF-SCOPE build-class / source-backed closure-cell,
+NOT an in-scope str/non-str-key dict semantic gap. Tracing fails at *class
+construction*, before any dict lookup/insertion behavior is exercised. The test
+defines a local class `Key3` (test_dict.py lines 1626-1635) whose `__eq__`
+method closes over the `nonlocal eq_count`:
+
+```python
+eq_count = 0
+class Key3:
+    def __hash__(self):
+        return hash('key3')
+    def __eq__(self, other):
+        nonlocal eq_count
+        ...
+        eq_count += 1
+```
+
+Dynamo routes `__build_class__` through `call___build_class__`
+(`builtin.py:1855`), which calls `get_function(allow_sourced_cells=True)`.
+Building the class function requires loading its closure cells via
+`side_effects.load_cell` (`functions.py:1973` -> `side_effects.py:541`). The
+closure cell is not populated through Dynamo's source-backed `__build_class__`
+closure path, so `load_cell` raises "Read uninitialized cell". This is the
+identical deferred-G29 / deferred-G3 class-body closure-cell construction
+pattern; making the gate pass would require source-backed `__build_class__`
+closure / local-class-construction machinery, which the early-exit rule places
+out of scope absent explicit human approval.
+
+G27 fix did NOT affect this test: the G27 change dropped the str-only assertion
+in `SideEffectsProxyDict.__setitem__`, but tracing here fails at class
+construction long before any instance/`__dict__` `__setitem__` is reached. The
+"str/non-str key" framing in the gate title refers to the CPython dict lookup
+optimization the *test body* exercises, but Dynamo never reaches that body.
+
+DEFERRED. No `torch/_dynamo` source change attempted. Sentinel
+`CPython313-test_dict-DictTest.test_str_nonstr` left in place. Working tree ends
+with only `coverage.md` modified.
 
 ## Proposed Gate Changes Awaiting Human Approval
 
