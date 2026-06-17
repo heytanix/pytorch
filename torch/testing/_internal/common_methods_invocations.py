@@ -9505,7 +9505,9 @@ def sample_inputs_scaled_dot_product_attention(op_info, device, dtype, requires_
     broadcast_tuple = ((num_heads, seq_q, head_dim), (batch, num_heads, seq_kv, head_dim))
 
     if op_info.name == "torch.ops.aten._scaled_dot_product_flash_attention_for_cpu":
+        # Exception: scaled_dot_product_attention_flash_attention: Accept only 4 dims inputs shape of {B, H, T, K}
         qkv_shapes = [(dim_4_q_shape, dim_4_kv_shape)]
+        # Exception: scaled_dot_product_attention_flash_attention: Currently do not support dropout > 0
         dropout_ps = [0.0]
     else:
         qkv_shapes = [(dim_3_q_shape, dim_3_kv_shape), (dim_4_q_shape, dim_4_kv_shape), broadcast_tuple]
@@ -18207,8 +18209,6 @@ op_db: list[OpInfo] = [
         supports_cow_input_no_materialize_forward=False,
         decorators=[onlyCPU],
         skips=(
-            # Bug: noncontiguous inputs produce NaN outputs - implementation doesn't handle strides correctly
-            DecorateInfo(unittest.expectedFailure, 'TestCommon', 'test_noncontiguous_samples', device_type='cpu'),
         )
     ),
     OpInfo(
