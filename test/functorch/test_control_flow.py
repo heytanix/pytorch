@@ -1687,6 +1687,44 @@ def forward(self, pred_1, x_1):
             self.assertEqual(t, fn(x)[0])
             self.assertIsNone(n)
 
+    def test_switch_three_branches_divergent_int_leaves(self):
+        def branch0(inp_x):
+            return inp_x.sin(), 0
+
+        def branch1(inp_x):
+            return inp_x.cos(), 1
+
+        def branch2(inp_x):
+            return inp_x.abs(), 2
+
+        def f(idx, inp_x):
+            return switch(idx, (branch0, branch1, branch2), (inp_x,))
+
+        x = torch.randn(4)
+        graph = make_fx(f, tracing_mode="symbolic")(torch.tensor([0]), x)
+        for i, fn in enumerate((branch0, branch1, branch2)):
+            t, n = graph(torch.tensor([i]), x)
+            self.assertEqual(t, fn(x)[0])
+            self.assertEqual(n, fn(x)[1])
+
+        def branch0_eq(inp_x):
+            return inp_x.sin(), 7
+
+        def branch1_eq(inp_x):
+            return inp_x.cos(), 7
+
+        def branch2_eq(inp_x):
+            return inp_x.abs(), 7
+
+        def g(idx, inp_x):
+            return switch(idx, (branch0_eq, branch1_eq, branch2_eq), (inp_x,))
+
+        graph_eq = make_fx(g, tracing_mode="symbolic")(torch.tensor([0]), x)
+        for i, fn in enumerate((branch0_eq, branch1_eq, branch2_eq)):
+            t, n = graph_eq(torch.tensor([i]), x)
+            self.assertEqual(t, fn(x)[0])
+            self.assertEqual(n, 7)
+
     def test_switch_branch_returns_float_rejected(self):
         # Python float leaves are blocked by the shared HOP output gate.
         # Captures the current behavior so a future relaxation of

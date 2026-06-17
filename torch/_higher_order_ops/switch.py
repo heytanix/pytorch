@@ -260,6 +260,26 @@ def switch_fake_tensor_mode(mode, index, branches, operands):
 def _merge_output(xs: tuple[torch.Tensor | int | None, ...], mode: FakeTensorMode):
     from torch._higher_order_ops.cond import _merge_output as cond_merge_output
 
+    # Shortcut if a branch produces None outputs; then all branches need to produce None
+    if any(x is None for x in xs):
+        if not all(x is None for x in xs):
+            raise AssertionError(f"expected all leaves to be None, got {xs}")
+        return None
+
+    # In case all branches return an int, use an unbacked symbol as the merge result
+    if all(type(x) is int for x in xs):
+        if all(x == xs[0] for x in xs):
+            return xs[0]
+        if mode.shape_env is None:
+            raise AssertionError("mode.shape_env is None")
+        merged_out = mode.shape_env.create_unbacked_symint()
+        mode.shape_env.constrain_symbol_range(
+            merged_out.node.expr,
+            min(xs),
+            max(xs),  # type: ignore[type-var]
+        )
+        return merged_out
+
     return functools.reduce(lambda a, b: cond_merge_output(a, b, mode), xs)
 
 
