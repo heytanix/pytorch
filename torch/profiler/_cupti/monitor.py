@@ -13,9 +13,7 @@ from collections.abc import Callable, Iterable  # noqa: TC003
 from pathlib import Path
 from typing import Any
 
-import torch
-
-from .cupti_python import (
+from cupti.cupti import (  # pyrefly: ignore[missing-import]
     ActivityAPI,
     ActivityCudaEvent2,
     ActivityExternalCorrelation,
@@ -25,12 +23,17 @@ from .cupti_python import (
     ActivityMemset4,
     ActivityOverhead3,
     ActivitySynchronization2,
+    ExternalCorrelationKind,
+)
+
+import torch
+
+from .cupti_python import (
     CUPTI_ACTIVITY_FLAG_FLUSH_FORCED,
     CUPTI_ERROR_MAX_LIMIT_REACHED,
     CUPTI_SUCCESS,
     disabled_driver_cbids,
     disabled_runtime_cbids,
-    ExternalCorrelationKind,
     find_cupti_library,
     OVERHEAD_KIND_NAMES,
 )

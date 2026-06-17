@@ -1,22 +1,32 @@
 # mypy: allow-untyped-defs
 """CUPTI type and constant definitions used by the in-process monitor.
 
-This module is the single place that reaches into the ``cupti-python`` package
-and into CUPTI's ABI constants. The cupti-python module is imported lazily and
-cached by :func:`_cupti`, and the activity kinds, enum values and record classes
-the monitor needs are re-exported as module attributes resolved on first access
-(see :func:`__getattr__`). Callers therefore just import what they use --
-``from .cupti_python import ActivityKind, ActivityKernel11`` -- and write
-``ActivityKind.MEMCPY`` directly (cupti-python's enums are ``IntEnum``, so kind
-members compare equal to the raw integer kind read from a record), while the
-cupti import stays deferred until one of those names is first touched.
+This module reaches into CUPTI's ABI constants. It does not re-export
+cupti-python's types; callers import those directly
+(``from cupti.cupti import ActivityKind``). The enums this module itself needs at
+runtime are imported eagerly below. cupti-python is a hard requirement, so
+importing this module without it raises ``ModuleNotFoundError`` (catchable by
+optional consumers).
 """
 
 from __future__ import annotations
 
 import os
-from functools import lru_cache
-from typing import Any
+
+
+# cupti-python enums used at runtime. cupti-python is a hard requirement of this
+# module; its absence surfaces as a catchable ModuleNotFoundError for optional
+# consumers (e.g. those probing the monitor import).
+try:
+    from cupti.cupti import (  # pyrefly: ignore[missing-import]
+        Driver_api_trace_cbid,
+        Runtime_api_trace_cbid,
+    )
+except ModuleNotFoundError as exc:
+    raise ModuleNotFoundError(
+        "torch.profiler._cupti requires the cupti-python package. "
+        "Install cupti-python to use the experimental CUPTI monitor."
+    ) from exc
 
 
 # Environment override for the libcupti to dlopen; see find_cupti_library().
@@ -44,56 +54,10 @@ OVERHEAD_KIND_NAMES: dict[int, str] = {
     8 << 16: "UVM Activity Init",
 }
 
-# cupti-python names re-exported lazily by __getattr__: the enums and the record
-# classes the monitor decodes. Resolved off the cupti module on first access.
-_REEXPORTED = frozenset(
-    {
-        "ActivityKind",
-        "ExternalCorrelationKind",
-        "Runtime_api_trace_cbid",
-        "Driver_api_trace_cbid",
-        "ActivityKernel11",
-        "ActivityMemcpy6",
-        "ActivityMemset4",
-        "ActivityAPI",
-        "ActivityExternalCorrelation",
-        "ActivityOverhead3",
-        "ActivityCudaEvent2",
-        "ActivitySynchronization2",
-    }
-)
 
-
-@lru_cache(maxsize=1)
-def _cupti() -> Any:
-    """Import and return the cupti-python module (once, cached)."""
-    try:
-        from cupti import cupti as cc  # pyrefly: ignore[missing-import]
-    except ModuleNotFoundError as exc:
-        # Keep this a ModuleNotFoundError (not a bare ImportError) so optional
-        # consumers that probe `import torch.profiler._cupti.monitor` degrade
-        # gracefully when cupti-python is absent.
-        raise ModuleNotFoundError(
-            "torch.profiler._cupti requires the cupti-python package. "
-            "Install cupti-python to use the experimental CUPTI monitor."
-        ) from exc
-
-    return cc
-
-
-def __getattr__(name: str) -> Any:
-    # Lazily expose cupti-python's enums and record classes as attributes of
-    # this module, so callers can `from .cupti_python import ActivityKind` and
-    # use `ActivityKind.MEMCPY` directly while the cupti import stays deferred.
-    if name in _REEXPORTED:
-        return getattr(_cupti(), name)
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-
-
-@lru_cache(maxsize=1)
 def disabled_runtime_cbids() -> tuple[int, ...]:
     """Runtime API callbacks filtered out of activity to cut trace volume."""
-    cbids = _cupti().Runtime_api_trace_cbid
+    cbids = Runtime_api_trace_cbid
     return (
         cbids.cudaGetDevice_v3020,
         cbids.cudaSetDevice_v3020,
@@ -104,10 +68,9 @@ def disabled_runtime_cbids() -> tuple[int, ...]:
     )
 
 
-@lru_cache(maxsize=1)
 def disabled_driver_cbids() -> tuple[int, ...]:
     """Driver API callbacks filtered out of activity to cut trace volume."""
-    cbids = _cupti().Driver_api_trace_cbid
+    cbids = Driver_api_trace_cbid
     return (
         cbids.cuKernelGetAttribute,
         cbids.cuDevicePrimaryCtxGetState,
