@@ -58,7 +58,7 @@ from .functions import UserFunctionVariable
 from .iter import IteratorVariable
 from .object_protocol import (
     generic_richcompare_bool,
-    long_as_ssize_t,
+    pylong_as_ssize_t,
     pyindex_check,
     type_implements_nb_index,
     validate_sequence_index,
@@ -1396,7 +1396,7 @@ class DequeVariable(CommonListMethodsVariable):
         # https://github.com/python/cpython/blob/v3.13.0/Modules/_collectionsmodule.c#L1729-L1736
         if isinstance(maxlen, ConstantVariable) and maxlen.value is None:
             return
-        if long_as_ssize_t(tx, maxlen) < 0:
+        if pylong_as_ssize_t(tx, maxlen) < 0:
             raise_observed_exception(
                 ValueError, tx, args=["maxlen must be non-negative"]
             )

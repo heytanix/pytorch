@@ -510,7 +510,7 @@ def vt_getitem(
     if type_implements_sq_item(obj_type):
         key_type = maybe_get_python_type(key)
         if type_implements_nb_index(key_type):
-            key = number_as_ssize_t(tx, key, IndexError)
+            key = pynumber_as_ssize_t(tx, key, IndexError)
             return vt_sequence_getitem(tx, obj, key)
         raise_type_error(
             tx,
@@ -598,7 +598,7 @@ def generic_setitem(
     if type_implements_sq_ass_item(o_type):
         key_type = maybe_get_python_type(key)
         if pyindex_check(key_type):
-            key_value = number_as_ssize_t(tx, key)
+            key_value = pynumber_as_ssize_t(tx, key)
             return vt_sequence_setitem(tx, o, key_value, value)
         raise_type_error(
             tx, f"sequence index must be integer, not '{key.python_type_name()}'"
@@ -739,11 +739,11 @@ def generic_float(
     )
 
 
-def long_as_ssize_t(tx: "InstructionTranslatorBase", obj: VariableTracker) -> int:
-    """Mirrors PyLong_AsSsize_t: requires an exact int (PyLong_Check).
+def pylong_as_ssize_t(tx: "InstructionTranslatorBase", obj: VariableTracker) -> int:
+    """Mirrors PyLong_AsSsize_t: requires an int (or subclass).
     values outside the Py_ssize_t range raise OverflowError.
 
-    https://github.com/python/cpython/blob/v3.13.0/Objects/longobject.c#L576
+    https://github.com/python/cpython/blob/60403a5409ff2c3f3b07dd2ca91a7a3e096839c7/Objects/longobject.c#L576
     """
     if not issubclass(obj.python_type(), int):
         raise_type_error(tx, "an integer is required")
@@ -757,7 +757,7 @@ def long_as_ssize_t(tx: "InstructionTranslatorBase", obj: VariableTracker) -> in
     return val
 
 
-def number_as_ssize_t(
+def pynumber_as_ssize_t(
     tx: "InstructionTranslatorBase",
     item: VariableTracker,
     err: type[Exception] | None = IndexError,
@@ -767,11 +767,11 @@ def number_as_ssize_t(
     On overflow (value outside the Py_ssize_t range) CPython remaps the
     OverflowError to `err`, or clips to the Py_ssize_t bounds when err is None.
 
-    https://github.com/python/cpython/blob/v3.13.0/Objects/abstract.c#L1645-L1690
+    https://github.com/python/cpython/blob/60403a5409ff2c3f3b07dd2ca91a7a3e096839c7/Objects/abstract.c#L1469
     """
     from .tensor import SymNodeVariable
 
-    value = item.nb_index_impl(tx)
+    value = pynumber_index(tx, item)
 
     # PyLong_AsSsize_t: a symbolic int must be specialized to a concrete
     # ssize_t (with guard) to be usable as a C index.
@@ -779,6 +779,9 @@ def number_as_ssize_t(
         val = value.evaluate_expr(tx.output)
     else:
         val = value.as_python_constant()
+
+    if not isinstance(val, int):
+        raise AssertionError("pynumber_index did not return an int-like value")
 
     if -sys.maxsize - 1 <= val <= sys.maxsize:
         return ConstantVariable.create(int(val))
@@ -792,7 +795,7 @@ def number_as_ssize_t(
     )
 
 
-def number_index(
+def pynumber_index(
     tx: "InstructionTranslatorBase", obj: VariableTracker
 ) -> "VariableTracker":
     """Mirrors PyNumber_Index (index(x) dispatch)."""
