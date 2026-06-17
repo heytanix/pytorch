@@ -249,9 +249,14 @@ jobs:
     name: test-diff-comment (testing)
     needs:
       - test-diff
+      - linux-jammy-py3_10-gcc11-build
       - get-label-type
     if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork == false
-    runs-on: "${{ needs.get-label-type.outputs.label-type }}linux.2xlarge"
+    # ARC container job (the classic EC2 pool is not provisioned in ARC mode); the build
+    # image just needs python3 -- post_comment is urllib-only and imports no torch.
+    runs-on: "${{ needs.get-label-type.outputs.label-type }}l-x86iavx512-8-64"
+    container:
+      image: ${{ needs.linux-jammy-py3_10-gcc11-build.outputs.docker-image }}
     permissions:
       pull-requests: write
       contents: read

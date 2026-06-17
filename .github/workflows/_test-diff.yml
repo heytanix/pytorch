@@ -5,6 +5,11 @@ name: test-diff
 # inside the build container, and uploads the result as a GHA artifact. It posts
 # nothing; the privileged comment is done by test-diff-comment.yml (workflow_run), so
 # no PR-code execution ever holds write permissions.
+#
+# Runs on the OSDC/ARC runner fleet that the `pull` workflow's build/test jobs use: a
+# container job on an ARC runner, mirroring _linux-test.yml's `test-osdc`. The classic
+# (EC2) runner pool is not provisioned in ARC mode, so a `runs-on: linux.4xlarge` job
+# would hang in "waiting for a runner".
 
 on:
   workflow_call:
@@ -21,14 +26,15 @@ on:
         required: false
         type: string
         default: ""
+      runner:
+        required: false
+        type: string
+        default: "l-x86iavx512-8-64"
+        description: ARC runner label (without prefix) to run on.
       s3-bucket:
         required: false
         type: string
         default: "gha-artifacts"
-      aws-role-to-assume:
-        required: false
-        type: string
-        default: ""
       platforms:
         required: false
         type: string
@@ -40,80 +46,59 @@ jobs:
     # Only meaningful for PRs; the fleet only runs on fork PRs once a maintainer adds a
     # ciflow label (trusted context), same as every other build/test job here.
     if: github.repository_owner == 'pytorch' && github.event_name == 'pull_request'
-    runs-on: ${{ inputs.runner_prefix }}linux.4xlarge
+    runs-on: ${{ inputs.runner_prefix }}${{ inputs.runner }}
+    container:
+      image: ${{ inputs.docker-image }}
     timeout-minutes: 30
+    permissions:
+      id-token: write
+      contents: read
+      actions: read
     steps:
-      - name: Setup SSH (Click me for login details)
-        uses: pytorch/test-infra/.github/actions/setup-ssh@main
-        with:
-          github-secret: ${{ secrets.GITHUB_TOKEN }}
-
       - name: Setup Linux
         uses: pytorch/pytorch/.github/actions/setup-linux@main
         with:
-          # testintro creates git worktrees of the base/head and reads test-file blobs
-          # at both refs; a treeless clone would lazy-fetch per blob and hang. Use a
-          # full checkout (same reason as _docs.yml).
+          use-arc: true
+          # testintro creates git worktrees of base/head and reads test-file blobs at
+          # both refs; a treeless clone would lazy-fetch per blob and hang. A normal
+          # checkout is full-history (fetch-depth 0), so merge-base + blob reads stay
+          # local.
           checkout-mode: normal
+          submodules: 'false'
+          github-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Login to ECR
-        uses: ./.github/actions/ecr-login
+      - name: Configure AWS credentials
+        id: aws-creds
+        continue-on-error: true
+        uses: aws-actions/configure-aws-credentials@8df5847569e6427dd6c4fb1cf565c83acfa8afa7
         with:
-          aws-role-to-assume: ${{ inputs.aws-role-to-assume }}
-
-      - name: Calculate docker image
-        id: calculate-docker-image
-        uses: pytorch/test-infra/.github/actions/calculate-docker-image@main
-        with:
-          docker-image-name: ${{ inputs.docker-image }}
-
-      - name: Pull docker image
-        uses: pytorch/test-infra/.github/actions/pull-docker-image@main
-        with:
-          docker-image: ${{ steps.calculate-docker-image.outputs.docker-image }}
+          role-to-assume: arn:aws:iam::308535385114:role/arc
+          aws-region: us-east-1
+          # The max duration enforced by the server side
+          role-duration-seconds: 18000
 
       - name: Download build artifacts
-        uses: ./.github/actions/download-build-artifacts
+        uses: pytorch/pytorch/.github/actions/download-build-artifacts@main
         with:
           name: ${{ inputs.build-environment }}
           s3-bucket: ${{ inputs.s3-bucket }}
+          use-gha: ${{ steps.aws-creds.outcome != 'success' }}
 
       - name: Compute test diff
         env:
-          DOCKER_IMAGE: ${{ steps.calculate-docker-image.outputs.docker-image }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           BASE_REF: ${{ github.event.pull_request.base.ref }}
           TESTINTRO_PLATFORMS: ${{ inputs.platforms }}
+          TESTINTRO_OUTPUT: test-diff-result.json
+          TESTINTRO_CACHE: ${{ runner.temp }}/testintro-cache
         run: |
           set -ex
-          container_name=$(docker run \
-            -e PR_NUMBER \
-            -e HEAD_SHA \
-            -e BASE_REF \
-            -e TESTINTRO_PLATFORMS \
-            -e TESTINTRO_OUTPUT=test-diff-result.json \
-            -e TESTINTRO_CACHE=/var/lib/jenkins/workspace/.testintro-cache \
-            -e GITHUB_WORKSPACE=/var/lib/jenkins/workspace \
-            --security-opt seccomp=unconfined \
-            --cap-add=SYS_PTRACE \
-            --tty \
-            --detach \
-            --user jenkins \
-            -v "${GITHUB_WORKSPACE}:/var/lib/jenkins/workspace" \
-            -w /var/lib/jenkins/workspace \
-            "${DOCKER_IMAGE}"
-          )
-          docker exec -t "${container_name}" bash -c "
-            set -ex
-            sudo chown -R jenkins . && git config --global --add safe.directory '*'
-            pip install \$(echo dist/*.whl)[opt-einsum]
-            python -m tools.testing.introspection.ci_run
-          "
-
-      - name: Chown workspace
-        uses: ./.github/actions/chown-workspace
-        if: always()
+          git config --global --add safe.directory '*'
+          # ci_run is the parent process and imports no torch; the wheel torch is
+          # imported only by collector worker subprocesses (launched by path).
+          pip install "$(echo dist/*.whl)[opt-einsum]"
+          python -m tools.testing.introspection.ci_run
 
       - name: Upload test-diff result
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
