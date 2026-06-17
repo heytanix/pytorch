@@ -6035,6 +6035,24 @@ class TestControlFlowTraced(TestCase):
         graph = make_fx(f, tracing_mode="symbolic")(x, torch.tensor(False))
         self.assertEqual(graph(x, torch.tensor(True)), f(x, torch.tensor(True)))
 
+    def test_switch_traced_mismatched_output_structure(self):
+        from torch._higher_order_ops.switch import switch_op
+
+        def branch0(inp_x):
+            return (inp_x.sin(), inp_x.cos())
+
+        def branch1(inp_x):
+            return {"a": inp_x.sin(), "b": inp_x.cos()}
+
+        def f(idx, inp_x):
+            return switch_op(idx, (branch0, branch1), (inp_x,))
+
+        x = torch.randn(4)
+        with self.assertRaisesRegex(
+            RuntimeError, "Unmatched output spec from torch.switch branches"
+        ):
+            make_fx(f)(torch.tensor([0]), x)
+
     def test_switch_traced_not_nested(self):
         def branch0(inp_x):
             return inp_x.sin()

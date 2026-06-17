@@ -178,13 +178,12 @@ def trace_switch(proxy_mode, func_overload, index, branches, operands):
             if node.op == "output":
                 branch_outs[i].extend(node.args)
 
-    flat_branch_outs = [pytree.arg_tree_leaves(*outs) for outs in branch_outs]
-    for i, outs in enumerate(flat_branch_outs):
-        if len(flat_branch_outs[0]) != len(outs):
-            raise AssertionError(
-                f"Expected to return same number of outputs from all branches but got:"
-                f"\n  branch0 returns {len(flat_branch_outs[0])} item(s)"
-                f"\n  branch{i} returns {len(outs)} item(s)"
+    branch_out_spec = [pytree.tree_flatten(outs)[1] for outs in branch_outs]
+    for i, spec in enumerate(branch_out_spec):
+        if branch_out_spec[0] != spec:
+            raise RuntimeError(
+                "Unmatched output spec from torch.switch branches: "
+                f"branch0 tree_spec {branch_out_spec[0]} vs branch{i} tree_spec {spec}"
             )
 
     uid, _ = unique_graph_id(proxy_mode, prefix="branch0_graph")
@@ -275,7 +274,7 @@ def _merge_output(xs: tuple[torch.Tensor | int | None, ...], mode: FakeTensorMod
         merged_out = mode.shape_env.create_unbacked_symint()
         mode.shape_env.constrain_symbol_range(
             merged_out.node.expr,
-            min(xs),
+            min(xs),  # type: ignore[type-var]
             max(xs),  # type: ignore[type-var]
         )
         return merged_out
