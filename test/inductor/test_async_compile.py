@@ -20,7 +20,7 @@ from torch._inductor.runtime.triton_heuristics import (
     generate_lookup_hash_from_source_code,
 )
 from torch._inductor.test_case import run_tests, TestCase
-from torch._inductor.utils import fresh_cache, ensure_nv_universal_gemm_available
+from torch._inductor.utils import ensure_nv_universal_gemm_available, fresh_cache
 from torch.testing._internal.common_utils import (
     instantiate_parametrized_tests,
     parametrize,
