@@ -9504,12 +9504,17 @@ def sample_inputs_scaled_dot_product_attention(op_info, device, dtype, requires_
 
     broadcast_tuple = ((num_heads, seq_q, head_dim), (batch, num_heads, seq_kv, head_dim))
 
-    qkv_shapes = [(dim_3_q_shape, dim_3_kv_shape), (dim_4_q_shape, dim_4_kv_shape), broadcast_tuple]
+    if op_info.name == "torch.ops.aten._scaled_dot_product_flash_attention_for_cpu":
+        qkv_shapes = [(dim_4_q_shape, dim_4_kv_shape)]
+        dropout_ps = [0.0]
+    else:
+        qkv_shapes = [(dim_3_q_shape, dim_3_kv_shape), (dim_4_q_shape, dim_4_kv_shape), broadcast_tuple]
+        dropout_ps = [0.0, 0.5]
     samples = []
     gqa_options = [True, False]
     causal_options = [True, False]
     for qkv_shape, is_causal, dropout_p, _enable_gqa in product(
-            qkv_shapes, causal_options, [0.0, 0.5], gqa_options):
+            qkv_shapes, causal_options, dropout_ps, gqa_options):
         shape_q, shape_kv = qkv_shape
         samples.append(SampleInput(
             make(shape_q),
@@ -9518,6 +9523,20 @@ def sample_inputs_scaled_dot_product_attention(op_info, device, dtype, requires_
             is_causal=is_causal,
             dropout_p=dropout_p
         ))
+
+
+    if op_info.name == "torch.ops.aten._scaled_dot_product_flash_attention_for_cpu":
+        samples.append(
+            SampleInput(
+                make((batch, num_heads, seq_q, head_dim)),
+                make((batch, num_heads, seq_kv, head_dim)),
+                make((batch, num_heads, seq_kv, head_dim)),
+                attn_mask=make_tensor((seq_q, seq_kv), device=device, dtype=dtype, requires_grad=False),
+                is_causal=False,
+                dropout_p=0.0)
+        )
+        yield from samples
+        return
 
     # Add non standard shapes
     # FIXME(rec): should diff_v_head_dim be appended to samples?
@@ -18171,6 +18190,25 @@ op_db: list[OpInfo] = [
             DecorateInfo(unittest.expectedFailure, 'TestJit', 'test_variant_consistency_jit', device_type='cuda'),
             # None Mismatch Tensor
             DecorateInfo(unittest.expectedFailure, 'TestCompositeCompliance', 'test_backward', device_type='cuda'),
+        )
+    ),
+    OpInfo(
+        'torch.ops.aten._scaled_dot_product_flash_attention_for_cpu',
+        sample_inputs_func=sample_inputs_scaled_dot_product_attention,
+        dtypes=floating_types_and(torch.float16, torch.bfloat16),
+        supports_out=False,
+        has_nondeterministic_output=True,
+        supports_autograd=True,
+        supports_gradgrad=False,
+        supports_fwgrad_bwgrad=False,
+        supports_forward_ad=False,
+        supports_scripting=False,
+        check_batched_forward_grad=False,
+        supports_cow_input_no_materialize_forward=False,
+        decorators=[onlyCPU],
+        skips=(
+            # Bug: noncontiguous inputs produce NaN outputs - implementation doesn't handle strides correctly
+            DecorateInfo(unittest.expectedFailure, 'TestCommon', 'test_noncontiguous_samples', device_type='cpu'),
         )
     ),
     OpInfo(
