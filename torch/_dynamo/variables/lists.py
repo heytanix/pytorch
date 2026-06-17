@@ -589,13 +589,13 @@ class RangeVariable(BaseListVariable):
     # range math needs concrete bounds; with assume_static_by_default=False a
     # range object's start/stop/step are wrapped as symbolic ints, so specialize
     # them (installing a guard) rather than assuming a plain constant.
-    def start(self) -> Any:
+    def start(self) -> int:
         return guard_if_dyn(self.items[0])
 
-    def stop(self) -> Any:
+    def stop(self) -> int:
         return guard_if_dyn(self.items[1])
 
-    def step(self) -> Any:
+    def step(self) -> int:
         return guard_if_dyn(self.items[2])
 
     def range_length(self) -> int:
