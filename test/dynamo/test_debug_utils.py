@@ -3,7 +3,7 @@
 import os
 from unittest.mock import patch
 
-from troch._internal.inductor_utils import GPU_TYPE
+from torch._internal.inductor_utils import GPU_TYPE
 
 import torch
 import torch._dynamo
