@@ -3416,20 +3416,26 @@ class MapHigherOrderVariable(TorchHigherOrderOperatorVariable):
             )
 
         # Build a parent-storage set from the xs subgraph placeholders that
-        # were detected as mutated, then re-map through ``all_map_inputs``
-        # to recover the parent-side indices. Lifted freevars are appended
-        # so storage matching also covers any captured-tensor that aliases
-        # an xs slice's storage.
-        all_map_inputs: list[VariableTracker | Proxy] = (
-            list(unpacked_xs) + list(unpacked_args) + list(body_lifted_freevars)
-        )
+        # were detected as mutated, then re-map through ``unpacked_xs`` to
+        # recover the parent-side xs indices. We deliberately only match
+        # against xs (not pos_args / freevars): map's contract permits
+        # mutation of xs only, and ``gen_schema`` only marks xs entries as
+        # mutated. If a pos_arg or freevar happened to share storage with
+        # an xs slice, matching it here would emit an index >= n_xs that
+        # ``auto_functionalize`` would then treat as a mutated pos_arg,
+        # creating a mismatch with the schema.
         mutated_input_storages = subgraph_mutated_input_storages(
             body_graph,
             {i for i in body_mutated_inputs if i < n_xs},
         )
         mutated_inputs = parent_mutated_input_indices(
-            all_map_inputs, mutated_input_storages
+            list(unpacked_xs), mutated_input_storages
         )
+        if any(i >= n_xs for i in mutated_inputs):
+            raise AssertionError(
+                f"map mutated_inputs must reference xs only "
+                f"(n_xs={n_xs}): {mutated_inputs}"
+            )
         mutated_arg_indices = ",".join(str(i) for i in mutated_inputs)
 
         body_nn_modules = dict(tx.output.nn_modules)

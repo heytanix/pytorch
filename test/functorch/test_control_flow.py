@@ -10218,11 +10218,12 @@ class <lambda>(torch.nn.Module):
         """Stripped-down version of self.check that runs eager + aot_eager
         but NOT inductor.
 
-        scan currently only has Steps 1-3 (gen_schema, py_functionalize_impl,
+        Used by HOP input-mutation tests (scan, map, ...). These HOPs
+        currently only have Steps 1-3 (gen_schema, py_functionalize_impl,
         Dynamo) wired for input mutation. Step 4 (Inductor MutationOutput
         emission) is a follow-up; until then the Inductor arm of the full
-        check() helper trips on the un-tracked mutation. This helper exercises
-        everything that IS in place for scan.
+        check() helper trips on the un-tracked mutation. This helper
+        exercises everything that IS in place.
         """
         args = pytree.tree_map(lambda t: t.to(device=device), args)
 
