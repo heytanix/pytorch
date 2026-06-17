@@ -9320,8 +9320,9 @@ def _wire_spec_slot(
     input (tensor dim or scalar arg).
     """
     from torch.fx.experimental.dynamic_spec import IntVar
+    from torch.utils._typing_utils import not_none
 
-    shape_env = size_sym.node.shape_env
+    shape_env = not_none(size_sym.node.shape_env)
 
     if isinstance(spec, IntVar):
         # Bare IntVar — first occurrence binds the spec sym to this input;
