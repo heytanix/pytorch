@@ -78,14 +78,13 @@ class MapImpl(HigherOrderOperator):
         # - xs is mutable: each iteration sees a storage-disjoint slice
         #   (xs[t] and xs[t+1] share no storage), so in-place writes are
         #   race-free regardless of evaluation order, preserving map's
-        #   "iterations are independent" contract. Mutations are surfaced
-        #   via auto_functionalize_v2 so the parent graph sees them.
-        # - pos_args is NOT mutable: every iteration sees the same tensor,
-        #   so mutating it makes iterations depend on each other, breaking
-        #   the independence contract and introducing a data race under any
-        #   parallel lowering. Users who need a shared mutable buffer
-        #   should use scan / while_loop, where sequential iteration is
-        #   part of the contract.
+        #   "iterations are independent" contract.
+        # - pos_args is NOT mutable: every iteration sees the same
+        #   tensor, so mutating it makes iterations depend on each
+        #   other, breaking the independence contract and introducing a
+        #   data race under any parallel lowering. Users who need a
+        #   shared mutable buffer should use scan / while_loop, where
+        #   sequential iteration is part of the contract.
         outputs = get_graph_output_example_values(body_gm)
         mutated_set = (
             {int(i) for i in mutated_arg_indices.split(",") if i}
