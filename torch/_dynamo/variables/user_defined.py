@@ -1203,7 +1203,6 @@ class UserDefinedClassVariable(UserDefinedVariable):
             if "maxlen" in bound_args.arguments:
                 maxlen = bound_args.arguments["maxlen"]
 
-            variables.lists.DequeVariable.validate_maxlen(tx, maxlen)
             return variables.lists.DequeVariable(
                 items, maxlen=maxlen, mutation_type=ValueMutationNew()
             )
