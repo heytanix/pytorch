@@ -31,6 +31,7 @@ import logging
 import threading
 from collections import deque
 from collections.abc import Callable  # noqa: TC003
+from typing import TYPE_CHECKING
 
 
 logger = logging.getLogger(__name__)
@@ -133,8 +134,11 @@ class WindowFinalizerMixin:
         comparison stays order-equivalent (convert_time is monotonic)."""
         return self.now_native_ns()
 
-    def now_native_ns(self) -> int:
-        raise NotImplementedError
+    if TYPE_CHECKING:
+        # now_native_ns is provided by the co-class CuptiMonitorObserver in the
+        # concrete observer's MRO; declared here only so the type checker sees it
+        # (a real def would shadow the co-class method at runtime).
+        def now_native_ns(self) -> int: ...
 
     def _collect_delivered(self, *, sync: bool) -> None:
         raise NotImplementedError
