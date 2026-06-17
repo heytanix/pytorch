@@ -562,6 +562,28 @@ def get_builtins_dict(global_scope: Scope) -> dict[str, Any]:
     return f_builtins
 
 
+def _restore_shallow_copy_placeholders(
+    snapshots: list[tuple[torch.fx.Node, torch.Tensor]],
+    gm: torch.fx.GraphModule,
+    example_inputs: list[Any],
+) -> None:
+    """Restore placeholder metadata mutated by shallow_copy_data_."""
+    if not snapshots:
+        return
+    placeholders = [n for n in gm.graph.nodes if n.op == "placeholder"]
+    for node, snapshot in snapshots:
+        node.meta["example_value"] = snapshot
+        if node in placeholders:
+            idx = placeholders.index(node)
+            if idx < len(example_inputs):
+                _copy_fake_device(example_inputs[idx], snapshot)
+
+
+def _copy_fake_device(dst: Any, src: Any) -> None:
+    if hasattr(dst, "fake_device") and hasattr(src, "fake_device"):
+        dst.fake_device = src.fake_device  # pyrefly: ignore[missing-attribute]
+
+
 class OutputGraphCommon(OutputGraphGuardsState):
     """
     A minimal interface for full graph capture. It is intended to be
@@ -2875,9 +2897,16 @@ class OutputGraph(OutputGraphCommon):
                 # a lot of fake_tensor ownership assumptions and runs afoul of detect_fake_mode
                 self.tracing_context.fake_mode = backend_fake_mode
 
+            example_inputs = self.example_inputs()
+            _restore_shallow_copy_placeholders(
+                getattr(self, "_shallow_copy_placeholder_snapshots", []),
+                gm,
+                example_inputs,
+            )
+
             gm.graph.lint()
             with self.restore_global_state():
-                compiled_fn = self.call_user_compiler(gm, self.example_inputs())
+                compiled_fn = self.call_user_compiler(gm, example_inputs)
 
             from torch.fx._lazy_graph_module import _LazyGraphModule
 

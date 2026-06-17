@@ -138,6 +138,7 @@ class InputAliasInfo:
     mutations_under_no_grad_or_inference_mode: bool
     mutation_inductor_storage_resize: bool
     mutates_storage_metadata: bool
+    mutation_is_shallow_copy_data: bool
     requires_grad: bool
     keep_input_mutations: bool
 
@@ -1166,6 +1167,10 @@ class AOTConfig:
     # This mode is used to track torch_fn metadata but can interfere with
     # certain tracing scenarios.
     _disable_torch_fn_metadata_mode: bool = False
+    # Input indices that use shallow_copy_data_ (from .data =)
+    # instead of set_. Detected from the Dynamo graph before
+    # AOTAutograd runs.
+    shallow_copy_data_input_indices: frozenset[int] = frozenset()
 
     def to_cacheable(self) -> CacheableAOTConfig:
         return CacheableAOTConfig(

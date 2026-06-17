@@ -123,6 +123,14 @@ def _create_graph(
             _allow_token_discovery=True,
         )
 
+    # Save arg devices before make_fx in case
+    # shallow_copy_data_ mutates them during tracing.
+    original_fake_devices = {
+        i: arg.fake_device
+        for i, arg in enumerate(args)
+        if isinstance(arg, torch.Tensor) and hasattr(arg, "fake_device")
+    }
+
     with (
         enable_python_dispatcher(),
         ctx,
@@ -134,6 +142,21 @@ def _create_graph(
             pre_dispatch=aot_config.pre_dispatch,
             _disable_torch_fn_metadata_mode=aot_config._disable_torch_fn_metadata_mode,
         )(*args)
+
+        # Restore arg devices mutated by shallow_copy_data_.
+        has_shallow_copy = any(
+            n.op == "call_function"
+            and n.target
+            in (
+                torch.ops.aten.shallow_copy_data_.default,
+                torch.ops.aten.shallow_copy_data_,
+            )
+            for n in fx_g.graph.nodes
+        )
+        if has_shallow_copy and original_fake_devices:
+            for i, device in original_fake_devices.items():
+                if args[i].fake_device != device:  # pyrefly: ignore[missing-attribute]
+                    args[i].fake_device = device  # pyrefly: ignore[missing-attribute]
 
         if args_descs is not None:
             flat_args_descs, _ = pytree.tree_flatten(args_descs)
@@ -354,6 +377,26 @@ def aot_dispatch_base_graph(
     saved_updated_flat_args_subclasses_desugared_descs = (
         updated_flat_args_subclasses_desugared_descs
     )
+
+    # Detect which inputs have shallow_copy_data_ mutations so
+    # the runtime replay uses the correct op instead of set_().
+    placeholders = [n for n in fw_module.graph.nodes if n.op == "placeholder"]
+    for node in fw_module.graph.nodes:
+        if (
+            node.op == "call_function"
+            and (
+                node.target is torch.ops.aten.shallow_copy_data_.default
+                or node.target is torch.ops.aten.shallow_copy_data_
+            )
+            and node.args
+            and node.args[0] in placeholders
+        ):
+            idx = placeholders.index(node.args[0])
+            if idx < len(fw_metadata.input_info):
+                fw_metadata.input_info[idx] = dataclasses.replace(
+                    fw_metadata.input_info[idx],
+                    mutation_is_shallow_copy_data=True,
+                )
 
     if aot_config.is_export and mod_when_exporting_non_strict is not None:
         # We update metadata to consider any assigned buffers as buffer mutations.

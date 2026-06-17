@@ -591,6 +591,15 @@ def create_aot_state(
                     pre_dispatch=aot_config.pre_dispatch,
                 )(*_dup_fake_script_obj(fake_flat_args))
 
+            # Mark inputs detected as shallow_copy_data_ from the
+            # Dynamo graph so runtime replay uses the right op.
+            for idx in aot_config.shallow_copy_data_input_indices:
+                if idx < len(fw_metadata.input_info):
+                    fw_metadata.input_info[idx] = dataclasses.replace(
+                        fw_metadata.input_info[idx],
+                        mutation_is_shallow_copy_data=True,
+                    )
+
             req_subclass_dispatch = requires_subclass_dispatch(
                 fake_flat_args, fw_metadata
             )
@@ -1194,6 +1203,28 @@ def aot_module_simplified(
             force_non_lazy_backward_lowering=config.force_non_lazy_backward_lowering,
             disable_functionalization=disable_functionalization,
         )
+
+        # Detect which inputs use shallow_copy_data_ from the
+        # Dynamo graph so AOTAutograd can distinguish it from set_().
+        if isinstance(mod, torch.fx.GraphModule):
+            scd_indices: set[int] = set()
+            placeholders = [n for n in mod.graph.nodes if n.op == "placeholder"]
+            for n in mod.graph.nodes:
+                if (
+                    n.op == "call_function"
+                    and (
+                        n.target is torch.ops.aten.shallow_copy_data_.default
+                        or n.target is torch.ops.aten.shallow_copy_data_
+                    )
+                    and n.args
+                    and n.args[0] in placeholders
+                ):
+                    scd_indices.add(placeholders.index(n.args[0]))
+            if scd_indices:
+                aot_config = dataclasses.replace(
+                    aot_config,
+                    shallow_copy_data_input_indices=frozenset(scd_indices),
+                )
 
         compiled_fn = None
 
