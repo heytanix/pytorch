@@ -77,11 +77,17 @@ def _full_path_worker(rank, world_size, q):
     EC = int(ActivityKind.EXTERNAL_CORRELATION)
     want = {
         ActivityKind.CONCURRENT_KERNEL: {
-            Kernel.CORRELATION_ID, Kernel.GRAPH_NODE_ID, Kernel.START, Kernel.END,
-            Kernel.NAME},
+            Kernel.CORRELATION_ID,
+            Kernel.GRAPH_NODE_ID,
+            Kernel.START,
+            Kernel.END,
+            Kernel.NAME,
+        },
         ActivityKind.EXTERNAL_CORRELATION: {
-            ExternalCorrelation.EXTERNAL_ID, ExternalCorrelation.CORRELATION_ID,
-            ExternalCorrelation.EXTERNAL_KIND},
+            ExternalCorrelation.EXTERNAL_ID,
+            ExternalCorrelation.CORRELATION_ID,
+            ExternalCorrelation.EXTERNAL_KIND,
+        },
         # Both API kinds are needed as the external-correlation carrier: NCCL
         # launches the collective kernel through the driver API.
         ActivityKind.RUNTIME: {Api.CORRELATION_ID},
@@ -116,19 +122,30 @@ def _full_path_worker(rank, world_size, q):
                 for i in range(n):
                     yield {f: col[i] for f, col in cols.items()}
 
-        timed = [{"correlation_id": int(r[int(Kernel.CORRELATION_ID)]),
-                  "graph_node_id": int(r[int(Kernel.GRAPH_NODE_ID)]),
-                  "start_ns": 0, "name": r[int(Kernel.NAME)]} for r in rows(K)]
-        ext_events = [{"external_id": int(r[int(ExternalCorrelation.EXTERNAL_ID)]),
-                       "correlation_id": int(r[int(ExternalCorrelation.CORRELATION_ID)]),
-                       "external_kind": int(r[int(ExternalCorrelation.EXTERNAL_KIND)])}
-                      for r in rows(EC)]
+        timed = [
+            {
+                "correlation_id": int(r[int(Kernel.CORRELATION_ID)]),
+                "graph_node_id": int(r[int(Kernel.GRAPH_NODE_ID)]),
+                "start_ns": 0,
+                "name": r[int(Kernel.NAME)],
+            }
+            for r in rows(K)
+        ]
+        ext_events = [
+            {
+                "external_id": int(r[int(ExternalCorrelation.EXTERNAL_ID)]),
+                "correlation_id": int(r[int(ExternalCorrelation.CORRELATION_ID)]),
+                "external_kind": int(r[int(ExternalCorrelation.EXTERNAL_KIND)]),
+            }
+            for r in rows(EC)
+        ]
         if not timed:
             q.put({"skip": "monitor collected no kernels (needs libcupti>=13.3)"})
             return
         _attach_metadata(timed, ext_events, ext_meta, None)
         tagged = [
-            json.loads(e["metadata"]) for e in timed
+            json.loads(e["metadata"])
+            for e in timed
             if "metadata" in e and "ncclDevKernel" in e["name"]
         ]
         q.put({"pushed": ext_id, "blob": ext_meta.get(ext_id), "tagged": tagged})
