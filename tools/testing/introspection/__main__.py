@@ -156,7 +156,9 @@ def _cmd_diff(args: argparse.Namespace) -> int:
         if a is None:
             print("error: pass --pr N or --from REF", file=sys.stderr)
             return 2
-    res = diff_mod.diff(jobs, a, b, files_filter=args.files, full=args.full)
+    res = diff_mod.diff(
+        jobs, a, b, files_filter=args.files, full=args.full, locations=args.locations
+    )
     if args.json:
         print(json.dumps(res, indent=2))
         return 0
@@ -276,6 +278,11 @@ def main(argv: list[str] | None = None) -> int:
         "--variants",
         action="store_true",
         help="show all added/removed, not just first 10",
+    )
+    p_diff.add_argument(
+        "--locations",
+        action="store_true",
+        help="also report each test's source file/line (added_loc/removed_loc in --json)",
     )
     p_diff.add_argument("--json", action="store_true")
     p_diff.set_defaults(func=_cmd_diff)

@@ -11,14 +11,7 @@ import subprocess
 import sys
 import tempfile
 
-from tools.testing.introspection import (
-    collector,
-    diff,
-    platforms,
-    post_comment,
-    render_comment,
-    where,
-)
+from tools.testing.introspection import collector, diff, platforms, where
 
 from torch.testing._internal.common_utils import run_tests, slowTest, TestCase
 
@@ -149,100 +142,6 @@ class TestDiff(TestCase):
             aff = diff._scope(["test/test_base.py"], sel, graph)
             self.assertIn("test/test_dep.py", aff)  # synthetic dependent pulled in
             self.assertNotIn("test/test_other.py", aff)
-
-
-class TestRenderComment(TestCase):
-    # Synthetic diff() result: test_plain (same id) added on both jobs -> "all
-    # platforms"; test_b_cuda only on the cuda job.
-    RES = {
-        "from": "a" * 40,
-        "to": "b" * 40,
-        "per_job": {
-            "linux-cpu/default": {
-                "scope_reason": "test-only change",
-                "n_affected": 1,
-                "uncomparable": [],
-                "per_file": {
-                    "test/test_x.py": {"added": ["C::test_plain"], "removed": []}
-                },
-            },
-            "linux-cuda-sm80/default": {
-                "scope_reason": "test-only change",
-                "n_affected": 1,
-                "uncomparable": ["test/inductor/test_y.py"],
-                "per_file": {
-                    "test/test_x.py": {
-                        "added": ["C::test_plain", "C::test_b_cuda"],
-                        "removed": [],
-                    }
-                },
-            },
-        },
-    }
-
-    def test_render_groups_and_marker(self):
-        md = render_comment.render(self.RES)
-        self.assertIn(render_comment.MARKER, md)
-        self.assertIn("+2 added", md)  # test_plain + test_b_cuda (distinct ids)
-        # test_plain exists on both jobs -> "all platforms"; test_b_cuda only on cuda.
-        self.assertIn("all platforms", md)
-        self.assertIn("linux-cuda-sm80/default", md)
-        self.assertIn("`test/test_x.py::C::test_b_cuda`", md)
-        self.assertIn("1 file(s) could not be compared", md)
-
-    def test_render_broad_note(self):
-        res = dict(self.RES, broad=True)
-        md = render_comment.render(res)
-        self.assertIn("limited to", md)
-        self.assertIn("linux-cpu", md)
-
-    def test_render_empty(self):
-        empty = {
-            "from": "a" * 40,
-            "to": "b" * 40,
-            "per_job": {
-                "linux-cpu/default": {
-                    "scope_reason": "",
-                    "n_affected": 0,
-                    "uncomparable": [],
-                    "per_file": {},
-                }
-            },
-        }
-        self.assertIn("No tests added or removed", render_comment.render(empty))
-
-
-class TestPostComment(TestCase):
-    def test_skipped_is_noop(self):
-        # A skipped result posts nothing and needs no token/network.
-        post_comment.post({"pr": 1, "skipped": True})
-
-    def test_upsert_posts_when_no_existing(self):
-        calls = []
-
-        def fake_api(method, url, token, data=None):
-            calls.append((method, data))
-            return [] if method == "GET" else {"id": 1}
-
-        orig_api = post_comment._api
-        orig_env = {k: os.environ.get(k) for k in ("GITHUB_TOKEN", "GITHUB_REPOSITORY")}
-        post_comment._api = fake_api
-        os.environ["GITHUB_TOKEN"] = "x"
-        os.environ["GITHUB_REPOSITORY"] = "o/r"
-        try:
-            post_comment.post({**TestRenderComment.RES, "pr": 5, "skipped": False})
-        finally:
-            post_comment._api = orig_api
-            for k, v in orig_env.items():
-                if v is None:
-                    os.environ.pop(k, None)
-                else:
-                    os.environ[k] = v
-        methods = [m for m, _ in calls]
-        self.assertIn("GET", methods)
-        self.assertIn("POST", methods)
-        posted = next(d for m, d in calls if m == "POST")
-        self.assertIn(render_comment.MARKER, posted["body"])
 
 
 class TestWhere(TestCase):

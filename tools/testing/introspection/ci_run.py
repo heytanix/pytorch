@@ -65,7 +65,7 @@ def main() -> int:
             "pr": pr,
             "skipped": False,
             "broad": broad,
-            **diff_mod.diff(jobs, merge_base, head),
+            **diff_mod.diff(jobs, merge_base, head, locations=True),
         }
 
     with open(out, "w") as f:
