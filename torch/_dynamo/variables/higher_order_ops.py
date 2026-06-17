@@ -3296,6 +3296,7 @@ class ScanHigherOrderVariable(TorchHigherOrderOperatorVariable):
 class MapHigherOrderVariable(TorchHigherOrderOperatorVariable):
     _HOP_NAME = "torch.ops.higher_order.map_impl"
     _ALLOW_FALLBACK_TO_EAGER = False
+    supports_input_mutation = False
     supports_aliasing = False
 
     def _call_function(
@@ -3304,9 +3305,6 @@ class MapHigherOrderVariable(TorchHigherOrderOperatorVariable):
         args: list[VariableTracker],
         kwargs: dict[str, VariableTracker],
     ) -> VariableTracker:
-        # Input mutation is only safe in inference: under autograd the
-        # functional rewrite of a mutating subgraph would lose the storage
-        # identity required for the backward pass.
         self.supports_input_mutation = not torch.is_grad_enabled()
 
         args, kwargs = LazyVariableTracker.realize_all((args, kwargs))
@@ -3401,10 +3399,6 @@ class MapHigherOrderVariable(TorchHigherOrderOperatorVariable):
         # Mutation handling: map allows in-place writes only to xs
         # (each iteration sees a storage-disjoint slice). Mutations of
         # pos_args are unsafe (see MapImpl.gen_schema for the contract)
-        # so we graph-break here with a precise message. The remaining
-        # indices are mapped through the parent-side input list to produce
-        # a comma-joined ``mutated_arg_indices`` kwarg for the HOP call,
-        # mirroring scan / while_loop.
         n_xs = len(unpacked_xs)
 
         pos_args_mutated = sorted(i - n_xs for i in body_mutated_inputs if i >= n_xs)
@@ -3459,14 +3453,11 @@ class MapHigherOrderVariable(TorchHigherOrderOperatorVariable):
             [arg.as_proxy() for arg in unpacked_args]
             + list(body_lifted_freevars.keys()),
         )
-        hop_kwargs = (
-            {"mutated_arg_indices": mutated_arg_indices} if mutated_arg_indices else {}
-        )
         return _call_function_and_unflatten_output(
             tx,
             torch.ops.higher_order.map_impl,
             p_args,
-            hop_kwargs,
+            {"mutated_arg_indices": mutated_arg_indices} if mutated_arg_indices else {},
             None,
             body_spec,
             body_r,

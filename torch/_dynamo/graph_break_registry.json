@@ -693,16 +693,6 @@
       ]
     }
   ],
-  "GB3946": [
-    {
-      "Gb_type": "torch.map: f mutates xs",
-      "Context": "xs={xs_mutated}",
-      "Explanation": "map only supports in-place mutation of pos_args (loop-invariant tensors). xs[t] is a fresh, storage-disjoint slice each step, so a mutation cannot be observed by any other iteration. The only externally-observable effect of mutating xs[t] is a write-back to xs's t-th slice, which is already expressible via the f return value. For in-place lifted buffers, pass them via pos_args.",
-      "Hints": [
-        "Your code may result in an error when running in eager. Please double check that your code doesn't contain a similar error when actually running eager/uncompiled. You can do this by removing the `torch.compile` call, or by using `torch.compiler.set_stance(\"force_eager\")`. "
-      ]
-    }
-  ],
   "GB4297": [
     {
       "Gb_type": "Call to `torch._dynamo.skip_frame()`",

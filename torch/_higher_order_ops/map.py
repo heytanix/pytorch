@@ -43,11 +43,17 @@ class MapImpl(HigherOrderOperator):
         super().__init__("map_impl")
 
     def __call__(self, f, xs, pos_args, *, mutated_arg_indices: str = ""):
-        kwargs = {}
-        if mutated_arg_indices:
-            kwargs["mutated_arg_indices"] = mutated_arg_indices
         # pyrefly: ignore [missing-attribute]
-        return super().__call__(f, xs, pos_args, **kwargs)
+        return super().__call__(
+            f,
+            xs,
+            pos_args,
+            **(
+                {"mutated_arg_indices": mutated_arg_indices}
+                if mutated_arg_indices
+                else {}
+            ),
+        )
 
     # pyrefly: ignore [bad-override]
     def gen_schema(self, f, xs, pos_args, mutated_arg_indices=""):
@@ -320,11 +326,12 @@ def trace_map(proxy_mode, func_overload, f, xs, pos_args, mutated_arg_indices=""
 
     node_args = (body_graph, list(xs), list(pos_args))
     proxy_args = pytree.tree_map(proxy_mode.tracer.unwrap_proxy, node_args)
-    kwargs = {}
-    if mutated_arg_indices:
-        kwargs["mutated_arg_indices"] = mutated_arg_indices
     out_proxy = proxy_mode.tracer.create_proxy(
-        "call_function", func_overload, proxy_args, kwargs, name="map_impl"
+        "call_function",
+        func_overload,
+        proxy_args,
+        {"mutated_arg_indices": mutated_arg_indices} if mutated_arg_indices else {},
+        name="map_impl",
     )
     return track_tensor_tree(
         fake_outs, out_proxy, constant=None, tracer=proxy_mode.tracer
