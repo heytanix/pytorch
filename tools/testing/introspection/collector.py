@@ -14,6 +14,7 @@ from __future__ import annotations
 import ast
 import hashlib
 import importlib.util
+import inspect
 import json
 import os
 import subprocess
@@ -311,6 +312,32 @@ def _enumerate(mod: ModuleType) -> dict[str, list[str]]:
     return out
 
 
+def _locate(mod: ModuleType) -> dict[str, list]:
+    """{"Class::method": [relfile, lineno]} for tests whose definition lives in the
+    test tree (TESTINTRO_ROOT). Generated/parametrized variants resolve to their
+    template function's def; tests defined outside the tree (e.g. torch-internal
+    mixins) are omitted, so the renderer leaves them unlinked."""
+    root = str(_root())
+    out: dict[str, list] = {}
+    for cname, cls in _testcase_classes(mod).items():
+        for mname in unittest.defaultTestLoader.getTestCaseNames(cls):
+            fn = getattr(cls, mname, None)
+            if fn is None:
+                continue
+            try:
+                fn = inspect.unwrap(fn)
+                src = inspect.getsourcefile(fn)
+                line = inspect.getsourcelines(fn)[1]
+            except (TypeError, OSError):
+                continue
+            if not src:
+                continue
+            ap = os.path.abspath(src)
+            if ap == root or ap.startswith(root + os.sep):
+                out[f"{cname}::{mname}"] = [os.path.relpath(ap, root), line]
+    return out
+
+
 class _Recorder(unittest.TestResult):
     def __init__(self) -> None:
         super().__init__()
@@ -384,10 +411,12 @@ def _select(job: Job) -> dict:
 
 
 def _collect_one(relpath: str, op: str, mod_name: str) -> dict:
-    if op == "enumerate":
-        return {
-            "classes": _enumerate(_import_target(relpath, gut=False, mod_name=mod_name))
-        }
+    if op in ("enumerate", "enumloc"):
+        mod = _import_target(relpath, gut=False, mod_name=mod_name)
+        out = {"classes": _enumerate(mod)}
+        if op == "enumloc":
+            out["locations"] = _locate(mod)
+        return out
     if op == "status":
         return _status(_import_target(relpath, gut=True, mod_name=mod_name))
     raise SystemExit(f"unknown op {op!r}")
