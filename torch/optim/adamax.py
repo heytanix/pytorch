@@ -233,8 +233,8 @@ def _single_tensor_adamax(
     eps: float,
     beta1: float,
     beta2: float,
-    lr: float,
-    weight_decay: float,
+    lr: float | Tensor,
+    weight_decay: float | int,
     maximize: bool,
     differentiable: bool,
     capturable: bool,
@@ -313,8 +313,8 @@ def _multi_tensor_adamax(
     eps: float,
     beta1: float,
     beta2: float,
-    lr: float,
-    weight_decay: float,
+    lr: float | Tensor,
+    weight_decay: float | int,
     maximize: bool,
     differentiable: bool,
     capturable: bool,
@@ -439,8 +439,8 @@ def adamax(
     eps: float,
     beta1: float,
     beta2: float,
-    lr: float,
-    weight_decay: float,
+    lr: float | Tensor,
+    weight_decay: float | int,
 ) -> None:
     r"""Functional API that performs adamax algorithm computation.
 

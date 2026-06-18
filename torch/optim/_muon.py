@@ -70,7 +70,9 @@ def _zeropower_via_newtonschulz(
     return ortho_grad
 
 
-def _adjust_lr(lr: float, adjust_lr_fn: str | None, param_shape: torch.Size) -> float:
+def _adjust_lr(
+    lr: float | Tensor, adjust_lr_fn: str | None, param_shape: torch.Size
+) -> float | Tensor:
     """Default learning rate adjustment used by Muon."""
     A, B = param_shape[:2]
 
@@ -320,8 +322,8 @@ def _single_tensor_muon(
     grads: list[Tensor],
     muon_momentum_bufs: list[Tensor],
     *,
-    lr: float,
-    weight_decay: float,
+    lr: float | Tensor,
+    weight_decay: float | int,
     momentum: float,
     nesterov: bool,
     ns_coefficients: tuple[float, float, float],
@@ -358,8 +360,8 @@ def muon(
     muon_momentum_bufs: list[Tensor],
     *,
     foreach: bool | None = None,
-    lr: float,
-    weight_decay: float,
+    lr: float | Tensor,
+    weight_decay: float | int,
     momentum: float,
     nesterov: bool,
     ns_coefficients: tuple[float, float, float],
