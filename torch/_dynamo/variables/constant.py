@@ -18,7 +18,7 @@ import torch
 from torch._dynamo.source import GetItemSource
 
 from .. import graph_break_hints, variables
-from ..exc import raise_observed_exception, unimplemented
+from ..exc import raise_observed_exception, raise_type_error, unimplemented
 from ..utils import (
     common_constant_types,
     istype,
@@ -170,11 +170,24 @@ class ConstantVariable(VariableTracker):
     def getitem_const(
         self, tx: InstructionTranslatorBase, arg: VariableTracker
     ) -> VariableTracker:
+        # bytes_subscript: https://github.com/python/cpython/blob/62a6e898e017c9878490544f6a227b8a187a949c/Objects/bytesobject.c#L1732
+        # unicode_subscript: https://github.com/python/cpython/blob/62a6e898e017c9878490544f6a227b8a187a949c/Objects/unicodeobject.c#L13738
         if isinstance(self.value, (str, bytes)):
-            from .object_protocol import validate_sequence_index
+            from .lists import SliceVariable
+            from .object_protocol import maybe_get_python_type, pyindex_check
 
-            container_name = "string" if isinstance(self.value, str) else "bytes"
-            arg = validate_sequence_index(tx, arg, container_name)
+            # _PyIndex_Check first, then slice, mirroring unicode_subscript /
+            # bytes_subscript.
+            if pyindex_check(maybe_get_python_type(arg)):
+                arg = arg.nb_index_impl(tx)
+            elif isinstance(arg, SliceVariable):
+                return ConstantVariable.create(self.value[arg.as_index_slice(tx)])
+            else:
+                raise_type_error(
+                    tx,
+                    f"{self.python_type_name()} indices must be integers, "
+                    f"not {arg.python_type_name()}",
+                )
         return ConstantVariable.create(
             self.value[arg.as_python_constant()],
         )
@@ -458,16 +471,6 @@ class ConstantVariable(VariableTracker):
     ) -> ConstantVariable:
         result = hasattr(self.value, name)
         return variables.ConstantVariable.create(result)
-
-    def is_python_equal(self, other: object) -> bool:
-        from .tensor import SymNodeVariable
-
-        if isinstance(other, SymNodeVariable):
-            return self.as_python_constant() == other.evaluate_expr()
-        return (
-            isinstance(other, VariableTracker)
-            and self.as_python_constant() == other.as_python_constant()
-        )
 
     def get_id(self, tx: InstructionTranslatorBase) -> int | None:
         # Singletons have guaranteed stable identity across the process lifetime.
@@ -798,6 +801,55 @@ class ConstantVariable(VariableTracker):
             tx, other, operator.add, type_implements_nb_add, reverse
         )
 
+    def nb_power_impl(
+        self,
+        tx: Any,
+        other: VariableTracker,
+        z: VariableTracker | None,
+        reverse: bool = False,
+    ) -> VariableTracker:
+        # CPython: int, float, and complex all define nb_power (bool inherits int's).
+        # https://github.com/python/cpython/blob/v3.13.0/Objects/longobject.c (long_pow)
+        # https://github.com/python/cpython/blob/v3.13.0/Objects/floatobject.c (float_pow)
+        # https://github.com/python/cpython/blob/v3.13.0/Objects/complexobject.c (complex_pow)
+
+        if z is not None:
+            z = z.as_python_constant()
+
+        if not other.is_python_constant():
+            return ConstantVariable.create(NotImplemented)
+
+        self_, other_ = (other, self) if reverse else (self, other)
+        v, w = (
+            self_.as_python_constant(),
+            other_.as_python_constant(),
+        )
+
+        try:
+            return VariableTracker.build(tx, pow(v, w, z))
+        except TypeError:
+            return ConstantVariable.create(NotImplemented)
+        except (ValueError, ZeroDivisionError, OverflowError) as e:
+            raise_observed_exception(type(e), tx, args=list(e.args))
+
+    def nb_power_z_impl(
+        self,
+        tx: Any,
+        v: VariableTracker,
+        w: VariableTracker,
+    ) -> VariableTracker:
+        if not isinstance(self.value, int):
+            return ConstantVariable.create(NotImplemented)
+        if not v.is_python_constant() or not w.is_python_constant():
+            return ConstantVariable.create(NotImplemented)
+        v_val, w_val = v.as_python_constant(), w.as_python_constant()
+        if not isinstance(v_val, int) or not isinstance(w_val, int):
+            return ConstantVariable.create(NotImplemented)
+        try:
+            return VariableTracker.build(tx, pow(v_val, w_val, self.value))
+        except (TypeError, ValueError, ZeroDivisionError, OverflowError) as e:
+            raise_observed_exception(type(e), tx, args=list(e.args))
+
     def nb_absolute_impl(
         self,
         tx: Any,
@@ -812,6 +864,15 @@ class ConstantVariable(VariableTracker):
             return ConstantVariable.create(abs(self.value))
         except OverflowError as e:
             raise_observed_exception(OverflowError, tx, args=list(e.args))
+
+    def nb_invert_impl(
+        self,
+        tx: Any,
+    ) -> VariableTracker:
+        # int: https://github.com/python/cpython/blob/v3.13.0/Objects/longobject.c#L5163-L5177
+        #   long_invert implements ~x as -(x+1).
+        # bool inherits nb_invert from int via slot inheritance.
+        return ConstantVariable.create(~self.value)
 
 
 CONSTANT_VARIABLE_NONE = ConstantVariable(None)
@@ -887,11 +948,6 @@ class FakeIdVariable(VariableTracker):
                 *graph_break_hints.SUPPORTABLE,
             ],
         )
-
-    def is_python_equal(self, other: object) -> bool:
-        if isinstance(other, (FakeIdVariable, ConstantVariable)):
-            return self.value == other.as_python_constant()
-        return False
 
     def reconstruct(self, codegen: Any) -> None:
         unimplemented(

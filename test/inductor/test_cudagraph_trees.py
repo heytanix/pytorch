@@ -2093,7 +2093,7 @@ if HAS_CUDA_AND_TRITON:
         @blas_library_context("cublas")
         @unittest.mock.patch.dict(os.environ, {"TORCH_DISABLE_ADDR2LINE": "0"})
         def test_workspace_allocation_error(self):
-            torch._C._cuda_clearCublasWorkspaces()
+            torch.cuda._clear_cublas_workspaces()
 
             prev = torch._inductor.cudagraph_trees.clear_cublas_manager
 
@@ -2133,7 +2133,7 @@ if HAS_CUDA_AND_TRITON:
                 self.assertTrue(thrown)
 
             finally:
-                torch._C._cuda_clearCublasWorkspaces()
+                torch.cuda._clear_cublas_workspaces()
                 torch._inductor.cudagraph_trees.clear_cublas_manager = prev
                 torch._inductor.cudagraph_trees.get_container(
                     self.device_idx
@@ -3896,31 +3896,6 @@ if HAS_CUDA_AND_TRITON:
             for _ in range(5):
                 _out = f_compiled(x, y)
             self.assertEqual(self.get_manager() is None, True)
-
-        @torch._inductor.config.patch("graph_partition", False)
-        def test_view_only_cuda_graph_skips_cudagraphs(self):
-            counters.clear()
-
-            def fn(x):
-                return x.reshape(1, -1, 4)
-
-            x = torch.randn(6, 4, device="cuda")
-            compiled_fn = torch.compile(fn, fullgraph=True)
-            with warnings.catch_warnings(record=True) as caught:
-                warnings.simplefilter("always")
-                for _ in range(3):
-                    actual = compiled_fn(x)
-                    torch.cuda.synchronize()
-
-            self.assertEqual(actual, fn(x))
-            self.assertFalse(
-                any("CUDA Graph is empty" in str(w.message) for w in caught)
-            )
-            self.assertEqual(counters["inductor"]["cudagraph_skips"], 1)
-            self.assertEqual(
-                counters["inductor"]["cudagraph_recorded_non_static_inputs"], 0
-            )
-            self.assertIsNone(self.get_manager())
 
         @torch._inductor.config.patch("graph_partition", True)
         def test_graph_partition_forward_backward(self):

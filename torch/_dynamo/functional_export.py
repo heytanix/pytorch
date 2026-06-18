@@ -6,6 +6,7 @@ import sys
 import traceback
 import types
 from collections import namedtuple
+from contextlib import nullcontext
 from typing import Any, cast, TYPE_CHECKING, TypeVar
 
 import sympy
@@ -35,8 +36,13 @@ if TYPE_CHECKING:
 
     from torch._dynamo.output_graph import OutputReturnInfo
     from torch._subclasses.fake_tensor import FakeTensorMode
+    from torch.export._trace import _DynamicShapesInput
     from torch.fx import Node
     from torch.fx.node import Argument, Target
+
+from torch.fx.experimental._spec_binding import _flatten_shapes_spec
+from torch.fx.experimental.dynamic_spec import ParamsSpec, ShapesSpec
+
 
 T = TypeVar("T")
 log = logging.getLogger(__name__)
@@ -897,7 +903,7 @@ def _dynamo_graph_capture_for_export(
     mod: Callable[..., Any],
     *,
     constraints: list[Constraint] | None = None,
-    dynamic_shapes: dict[str, Any] | tuple[Any] | list[Any] | None = None,
+    dynamic_shapes: _DynamicShapesInput = None,
 ) -> Callable[..., torch.fx.GraphModule]:
     """
     Improved dynamo graph capture using transformer approach with proper fake tensor handling.
@@ -920,7 +926,6 @@ def _dynamo_graph_capture_for_export(
     2. Need to attach guards
     """
 
-    _dynamic_shapes = dynamic_shapes
     _constraints = constraints
 
     def inner(*args: Any, **kwargs: Any) -> torch.fx.GraphModule:
@@ -932,9 +937,6 @@ def _dynamo_graph_capture_for_export(
             orig_callable = mod.forward if isinstance(mod, torch.nn.Module) else mod
 
             constraints: list[Constraint] | None = _constraints
-            dynamic_shapes: dict[str, Any] | tuple[Any] | list[Any] | None = (
-                _dynamic_shapes
-            )
 
             from . import reset  # type: ignore[attr-defined]
 
@@ -957,10 +959,29 @@ def _dynamo_graph_capture_for_export(
                 install_free_tensors=torch._dynamo.config.install_free_tensors_for_export,
             )
 
+            # If `dynamic_shapes` is a ShapesSpec/ParamsSpec, auto-wrap
+            # ParamsSpec → ShapesSpec, flatten into the (args, kwargs) layout
+            # the tracer builds above, and expose it via
+            # `torch._dynamo.config._shapes_spec` for the variable builder.
+            shapes_spec_in_use = False
+            shapes_spec_ctx = nullcontext()
+            if isinstance(dynamic_shapes, (ShapesSpec, ParamsSpec)):
+                shapes_spec_in_use = True
+                user_spec = (
+                    ShapesSpec(dynamic_shapes)
+                    if isinstance(dynamic_shapes, ParamsSpec)
+                    else dynamic_shapes
+                )
+                flattened_spec = _flatten_shapes_spec(mod, args, kwargs, user_spec)
+                shapes_spec_ctx = torch._dynamo.config.patch(
+                    _shapes_spec=flattened_spec
+                )
+
             with (
                 get_metrics_context(),
                 dynamo_timed("fullgraph_capture"),
                 dynamo_config_ctx,
+                shapes_spec_ctx,
             ):
                 out = fullgraph_capture(
                     module_to_trace,
@@ -985,15 +1006,18 @@ def _dynamo_graph_capture_for_export(
                     graph.recompile()
                     fake_mode = None
 
-                _suggest_or_raise_constraint_violation(
-                    module_to_trace,
-                    orig_callable,
-                    fake_mode,
-                    out,
-                    args,
-                    kwargs,
-                    dynamic_shapes,
-                )
+                # ShapesSpec is unbacked based, constraint violations are not
+                # relevant.
+                if not shapes_spec_in_use:
+                    _suggest_or_raise_constraint_violation(
+                        module_to_trace,
+                        orig_callable,
+                        fake_mode,
+                        out,
+                        args,
+                        kwargs,
+                        dynamic_shapes,  # type: ignore[arg-type]
+                    )
 
                 # Extract export metadata from the new location
                 export_metadata = out.graph_capture_output.output_graph.export_metadata
