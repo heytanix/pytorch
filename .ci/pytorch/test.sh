@@ -2119,14 +2119,25 @@ test_operator_microbenchmark() {
   # OP_BENCHMARK_TESTS env var can override the default operator list (set via _linux-test.yml matrix)
   local op_list="${OP_BENCHMARK_TESTS:-matmul mm addmm bmm conv optimizer activation norm scaled_mm scaled_grouped_mm}"
   for op in $op_list; do
-    $TASKSET python -m "pt.${op}_test" --tag-filter long \
-      --output-json-for-dashboard "${TEST_REPORTS_DIR}/operator_microbenchmark_${op}_compile${suffix}.json" \
-      --benchmark-name "PyTorch operator microbenchmark" --use-compile \
-      2>"${TEST_REPORTS_DIR}/operator_microbenchmark_${op}_compile${suffix}.stderr.log"
-    $TASKSET python -m "pt.${op}_test" --tag-filter long \
-      --output-json-for-dashboard "${TEST_REPORTS_DIR}/operator_microbenchmark_${op}${suffix}.json" \
-      --benchmark-name "PyTorch operator microbenchmark" \
-      2>"${TEST_REPORTS_DIR}/operator_microbenchmark_${op}${suffix}.stderr.log"
+    if [[ "$BUILD_ENVIRONMENT" == *rocm* ]]; then
+      # ROCm hipBLASLt can flood stderr; discard for usable CI logs (errors still fail via exit code).
+      # Temporary until https://github.com/ROCm/rocm-libraries/pull/8184 is reflected in the CI image.
+      $TASKSET python -m "pt.${op}_test" --tag-filter long \
+        --output-json-for-dashboard "${TEST_REPORTS_DIR}/operator_microbenchmark_${op}_compile${suffix}.json" \
+        --benchmark-name "PyTorch operator microbenchmark" --use-compile \
+        2>/dev/null
+      $TASKSET python -m "pt.${op}_test" --tag-filter long \
+        --output-json-for-dashboard "${TEST_REPORTS_DIR}/operator_microbenchmark_${op}${suffix}.json" \
+        --benchmark-name "PyTorch operator microbenchmark" \
+        2>/dev/null
+    else
+      $TASKSET python -m "pt.${op}_test" --tag-filter long \
+        --output-json-for-dashboard "${TEST_REPORTS_DIR}/operator_microbenchmark_${op}_compile${suffix}.json" \
+        --benchmark-name "PyTorch operator microbenchmark" --use-compile
+      $TASKSET python -m "pt.${op}_test" --tag-filter long \
+        --output-json-for-dashboard "${TEST_REPORTS_DIR}/operator_microbenchmark_${op}${suffix}.json" \
+        --benchmark-name "PyTorch operator microbenchmark"
+    fi
   done
 }
 
