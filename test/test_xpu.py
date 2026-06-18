@@ -3002,6 +3002,7 @@ class TestCachingHostAllocatorXpuGraph(TestCase):
             else:
                 self.assertNotEqual(new_data_ptr, old_data_ptr)
 
+
 @unittest.skipIf(not TEST_XPU, "XPU not available, skipping tests")
 @torch.testing._internal.common_utils.markDynamoStrictTest
 class TestXpuNativeMath(TestCase):
@@ -3054,6 +3055,7 @@ class TestXpuNativeMath(TestCase):
         # Mean of LogNormal(mu, sigma) = exp(mu + sigma^2/2) = exp(0.125) ≈ 1.133
         expected_mean = math.exp(0.0 + 0.5**2 / 2)
         self.assertTrue(abs(x.mean().item() - expected_mean) < 0.05)
+
 
 @unittest.skipIf(not TEST_XPU, "XPU not available, skipping tests")
 @torch.testing._internal.common_utils.markDynamoStrictTest
