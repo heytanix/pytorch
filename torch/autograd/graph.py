@@ -972,8 +972,11 @@ def _engine_run_backward(
     if attach_logging_hooks:
         unregister_hooks = _register_logging_hooks_on_whole_graph(t_outputs)
 
-    # Need to save the context so compiler config will be visible in device threads
+    # Need to save the context so compiler config will be visible in device
+    # threads. The origin thread id lets same-thread callbacks keep normal
+    # ContextVar mutation semantics.
     torch._C._stash_obj_in_tls("context", contextvars.copy_context())
+    torch._C._stash_obj_in_tls("context_origin_thread_id", threading.get_ident())
 
     try:
         return Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
@@ -987,3 +990,4 @@ def _engine_run_backward(
         # exits while a SafePyObject is still in its thread_local,
         # __call_tls_dtors fires the destructor → take_gil → deadlock.
         torch._C._remove_obj_from_tls("context")
+        torch._C._remove_obj_from_tls("context_origin_thread_id")
