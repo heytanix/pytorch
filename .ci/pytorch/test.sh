@@ -2118,19 +2118,18 @@ test_operator_microbenchmark() {
   # NOTE: When adding a new test here, please update README: ../../benchmarks/operator_benchmark/README.md
   # OP_BENCHMARK_TESTS env var can override the default operator list (set via _linux-test.yml matrix)
   local op_list="${OP_BENCHMARK_TESTS:-matmul mm addmm bmm conv optimizer activation norm scaled_mm scaled_grouped_mm}"
-  local op_list="${OP_BENCHMARK_TESTS:-scaled_grouped_mm}"
   for op in $op_list; do
     if [[ "$BUILD_ENVIRONMENT" == *rocm* ]]; then
-      # ROCm hipBLASLt can flood stderr; discard for usable CI logs (errors still fail via exit code).
-      # Temporary until https://github.com/ROCm/rocm-libraries/pull/8184 is reflected in the CI image.
+      # ROCm hipBLASLt spams this line to stderr (see ROCm/rocm-libraries#8184); drop only that line from logs.
+      local _hipblaslt_stderr_filter='Warning: Stream-K Data Parallel does not support GSU > 1'
       $TASKSET python -m "pt.${op}_test" --tag-filter long \
         --output-json-for-dashboard "${TEST_REPORTS_DIR}/operator_microbenchmark_${op}_compile${suffix}.json" \
-        --benchmark-name "PyTorch operator microbenchmark" --use-compile #\
-        #2>/dev/null
+        --benchmark-name "PyTorch operator microbenchmark" --use-compile \
+        2> >(grep --line-buffered -vF "${_hipblaslt_stderr_filter}" >&2)
       $TASKSET python -m "pt.${op}_test" --tag-filter long \
-        --output-json-for-dashboard "${TEST_REPORTS_DIR}/operator_microbenchmark_${op}${suffix}.json" #\
+        --output-json-for-dashboard "${TEST_REPORTS_DIR}/operator_microbenchmark_${op}${suffix}.json" \
         --benchmark-name "PyTorch operator microbenchmark" \
-        #2>/dev/null
+        2> >(grep --line-buffered -vF "${_hipblaslt_stderr_filter}" >&2)
     else
       $TASKSET python -m "pt.${op}_test" --tag-filter long \
         --output-json-for-dashboard "${TEST_REPORTS_DIR}/operator_microbenchmark_${op}_compile${suffix}.json" \
