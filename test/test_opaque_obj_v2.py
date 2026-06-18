@@ -1362,7 +1362,7 @@ def forward(self, arg0_1, arg1_1):
             """\
 def forward(self, arg0_1, arg1_1):
     noisy_inject = torch.ops._TestOpaqueObject.noisy_inject.default(arg1_1, arg0_1);  arg1_1 = None
-    mul = torch.ops.aten.mul.Tensor(noisy_inject, 1);  noisy_inject = None
+    mul = torch.ops.aten.mul.Scalar(noisy_inject, 1);  noisy_inject = None
     noisy_inject_1 = torch.ops._TestOpaqueObject.noisy_inject.default(mul, arg0_1);  mul = arg0_1 = None
     add = torch.ops.aten.add.Tensor(noisy_inject_1, noisy_inject_1);  noisy_inject_1 = None
     return (add,)""",
