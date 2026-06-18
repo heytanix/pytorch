@@ -466,8 +466,7 @@ def _make_fake_inputs_with_spec(
                 if x != leaf_spec:
                     raise ValueError(
                         f"shapes_spec declared {source.name} as static with "
-                        f"value {leaf_spec}, but while tracing we found that "
-                        f"it was actually {x}"
+                        f"value {leaf_spec}, but got {x} at trace time"
                     )
                 return x
             if isinstance(leaf_spec, (IntVar, torch.SymInt)):
