@@ -23,6 +23,7 @@ serialized format:
 from __future__ import annotations
 
 import contextlib
+import copy
 import dataclasses
 import logging
 import os
@@ -76,6 +77,27 @@ if TYPE_CHECKING:
     from .triton_bundler import TritonBundle
 
 log = logging.getLogger(__name__)
+
+
+def _boxed_inputs_have_forward_grad(inputs: Sequence[Any]) -> bool:
+    if torch.autograd.forward_ad._current_level < 0:
+        return False
+
+    for value in inputs:
+        if isinstance(value, torch.Tensor):
+            tangent = torch.autograd.forward_ad.unpack_dual(value).tangent
+            if tangent is not None:
+                return True
+    return False
+
+
+def _copy_graph_module_without_metadata(
+    gm: torch.fx.GraphModule,
+) -> torch.fx.GraphModule:
+    gm_copy = copy.deepcopy(gm)
+    for node in gm_copy.graph.nodes:
+        node.meta.clear()
+    return gm_copy
 
 
 @dataclasses.dataclass
@@ -536,11 +558,12 @@ class CompiledFxGraph(OutputCode):
     _compile_context: CompileContext | None = dataclasses.field(
         default=None, init=False, repr=False, compare=False
     )
-    # Metadata-stripped copy of the FX graph for fake tensor propagation.
+    # Metadata-stripped copy of the FX graph for runtime fallbacks/wrappers.
     # Running this graph under FakeTensorMode re-derives output shapes
     # (including aliasing) from the input shapes.
     _original_gm: torch.fx.GraphModule | None = None
     _serialized_original_gm: bytes | None = None
+    _forward_ad_fallback_installed: bool = False
 
     def __init__(
         self,
@@ -715,16 +738,40 @@ class CompiledFxGraph(OutputCode):
         # This is set at compile time to avoid runtime overhead
         self._wrap_compiled_regions = config.wrap_inductor_compiled_regions
 
-        if self._wrap_compiled_regions:
-            # Store a metadata-stripped copy of the FX graph. Running this
-            # under FakeTensorMode re-derives output shapes and aliasing
-            # from the input fake tensors.
-            import copy
+        # Store a metadata-stripped copy of the FX graph for runtime fallbacks
+        # that need eager FX execution after compilation.  The original gm can
+        # contain large node metadata, so do not keep it alive here.  Backward
+        # graphs do not need the forward AD fallback; only preserve them when
+        # compiled-region wrapping needs a graph for fake tensor propagation.
+        if (
+            not fx_kwargs.get("is_backward", False)
+            or config.wrap_inductor_compiled_regions
+        ):
+            self._original_gm = _copy_graph_module_without_metadata(gm)
+        self._forward_ad_fallback_installed = False
 
-            gm_copy = copy.deepcopy(gm)
-            for node in gm_copy.graph.nodes:
-                node.meta.clear()
-            self._original_gm = gm_copy
+    def _load_original_gm(self) -> torch.fx.GraphModule | None:
+        if self._original_gm is not None:
+            return self._original_gm
+        if self._serialized_original_gm is None:
+            return None
+
+        from torch._subclasses import FakeTensorMode
+        from torch.fx._graph_pickler import GraphPickler
+        from torch.fx.experimental.symbolic_shapes import ShapeEnv
+
+        fake_mode = FakeTensorMode(
+            allow_non_fake_inputs=True,
+            shape_env=ShapeEnv(),
+        )
+        original_gm = cast(
+            torch.fx.GraphModule,
+            GraphPickler.loads(self._serialized_original_gm, fake_mode),
+        )
+        original_gm.recompile()
+        self._original_gm = original_gm
+        self._serialized_original_gm = None
+        return self._original_gm
 
     def __del__(self) -> None:
         if self.compiled_fn_runner is not None:
@@ -913,22 +960,39 @@ class CompiledFxGraph(OutputCode):
             self.mutated_input_idxs,
         )
 
-        if self._original_gm is None and self._serialized_original_gm is not None:
-            from torch._subclasses import FakeTensorMode
-            from torch.fx._graph_pickler import GraphPickler
-            from torch.fx.experimental.symbolic_shapes import ShapeEnv
+        if (
+            self._original_gm is None
+            and self._wrap_compiled_regions
+            and isinstance(constants, CompiledFxGraphConstantsWithGm)
+        ):
+            self._original_gm = _copy_graph_module_without_metadata(constants.gm)
+        if self._wrap_compiled_regions:
+            self._load_original_gm()
 
-            fake_mode = FakeTensorMode(
-                allow_non_fake_inputs=True,
-                shape_env=ShapeEnv(),
+        if (
+            self.current_callable is not None
+            and not is_backward
+            and not self._forward_ad_fallback_installed
+        ):
+            original_callable = self.current_callable
+
+            @torch._dynamo.disable(  # type: ignore[misc]
+                reason="do not trace Inductor forward AD fallback"
             )
-            original_gm = cast(
-                torch.fx.GraphModule,
-                GraphPickler.loads(self._serialized_original_gm, fake_mode),
-            )
-            original_gm.recompile()
-            self._original_gm = original_gm
-            self._serialized_original_gm = None
+            def forward_ad_fallback(inputs):
+                if _boxed_inputs_have_forward_grad(inputs):
+                    gm = self._load_original_gm()
+                    if gm is None:
+                        raise RuntimeError(
+                            "Inductor received forward AD inputs, but the original "
+                            "FX graph is unavailable for tangent-preserving fallback."
+                        )
+                    counters["inductor"]["forward_ad_fallback"] += 1
+                    return gm.forward(*inputs)
+                return original_callable(inputs)
+
+            self.current_callable = forward_ad_fallback
+            self._forward_ad_fallback_installed = True
 
         # Apply inductor_compiled_code HOP wrapper if configured
         # This is done in post_compile to ensure it works with cached artifacts
@@ -968,13 +1032,14 @@ class CompiledFxGraph(OutputCode):
         self.current_callable = None
         self.recursively_apply_fns = None
         self.compiled_fn_runner = None
+        self._forward_ad_fallback_installed = False
         if self._original_gm is not None:
             from torch.fx._graph_pickler import GraphPickler, Options
 
             self._serialized_original_gm = GraphPickler.dumps(
                 self._original_gm, Options(ops_filter=None)
             )
-            self._original_gm = None
+        self._original_gm = None
         # Note: _serialized_fx_graph is already in serializable form (SerializedGraphModule)
         # so it doesn't need to be cleared
 
