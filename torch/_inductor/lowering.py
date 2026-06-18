@@ -945,15 +945,36 @@ def to_dtype(
     src_dtype = x.get_dtype()
     if src_dtype == dtype:
         return clone(x) if copy else x
+    low_pr_fp = (torch.bfloat16, torch.float16)
+    current_node = (
+        getattr(V.graph, "current_node", None) if V.graph is not None else None
+    )
+    should_round_lowp_source = (
+        config.emulate_precision_casts
+        and isinstance(current_node, torch.fx.Node)
+        and current_node.meta.get("low_precision_pointwise_barrier", False)
+        and src_dtype in low_pr_fp
+        and dtype not in low_pr_fp
+        and not ir.is_storage_and_layout(x)
+    )
 
     def _to_dtype(x):
+        x_to_convert = x
+        if should_round_lowp_source:
+            # Type promotion can widen a fused lowp expression before the
+            # eager-visible barrier gets a chance to round its inputs.
+            x_to_convert = ops.to_dtype(
+                x,
+                src_dtype,
+                src_dtype=src_dtype,
+                use_compute_types=False,
+            )
         result = ops.to_dtype(
-            x,
+            x_to_convert,
             dtype,
             src_dtype=src_dtype,
             use_compute_types=use_compute_types,
         )
-        low_pr_fp = (torch.bfloat16, torch.float16)
         if not use_compute_types and dtype in low_pr_fp:
             # Upcast back to compute type so fused consumers see a compute-type
             # value. Without this, a raw low-precision value gets a redundant
