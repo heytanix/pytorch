@@ -55,6 +55,22 @@ def _first_tensor_placeholder_shape(gm):
     raise AssertionError("no tensor placeholder found")
 
 
+def _placeholder_dim0_sym_names(gm):
+    """Return the stringified dim-0 SymInt name for each tensor placeholder.
+
+    Used to keep ``assertExpectedInline`` snapshots stable against
+    ShapeEnv's process-wide fresh-symbol counter (which ``setUp`` does
+    not reset).
+    """
+    names = []
+    for _node, val in _user_input_placeholders(gm):
+        if isinstance(val, torch.Tensor):
+            sym = val.shape[0]
+            if isinstance(sym, torch.SymInt):
+                names.append(str(sym))
+    return names
+
+
 def _has_assert_scalar(gm):
     """True if the graph contains an aten._assert_scalar runtime-assert node."""
     return any(
@@ -181,6 +197,7 @@ Range constraints: {u0: VR[0, int_oo]}""",
             strict=self.strict,
         )
 
+    @_fx_experimental_config.patch(no_data_dependent_graph_break=True)
     def test_unbacked_raises_dde_on_branching(self):
         """Without min/max, branching on a ShapeVar dim raises a DDE.
         Strict wraps it as UserError; non-strict raises the raw DDE.
@@ -200,7 +217,6 @@ Range constraints: {u0: VR[0, int_oo]}""",
                 strict=self.strict,
             )
 
-    @_fx_experimental_config.patch(no_data_dependent_graph_break=True)
     def test_tensor_dim_optimization_hint_in_shape_env(self):
         b = VAR("batch", optimization_hint=32)
         ep = export(
@@ -387,8 +403,8 @@ Range constraints: {u0: VR[0, int_oo], u1: VR[0, int_oo]}""",
         )
 
         # Snapshot legacy graph (backed s* symbol, range constraint).
-        # Strict uses s6; non-strict uses s77 (different fresh-symbol counters).
-        legacy_sym = "s6" if self.strict else "s77"
+        # Symbol name is whatever ShapeEnv allocated (counter is process-wide).
+        (legacy_sym,) = _placeholder_dim0_sym_names(ep_legacy.graph_module)
         self.assertExpectedInline(
             str(ep_legacy).strip(),
             f"""\
@@ -463,7 +479,8 @@ Range constraints: {u0: VR[0, int_oo]}""",
         )
 
         # Snapshot legacy: placeholders are (x, y) in signature order.
-        sx, sy = ("s6", "s27") if self.strict else ("s77", "s17")
+        # Symbol names are whatever ShapeEnv allocated (counter is process-wide).
+        sx, sy = _placeholder_dim0_sym_names(ep_legacy.graph_module)
         self.assertExpectedInline(
             str(ep_legacy).strip(),
             f"""\
@@ -538,7 +555,8 @@ Range constraints: {u0: VR[0, int_oo], u1: VR[0, int_oo]}""",
         )
 
         # Legacy: only x in graph signature, no y placeholder.
-        legacy_sym = "s6" if self.strict else "s77"
+        # Symbol name is whatever ShapeEnv allocated (counter is process-wide).
+        (legacy_sym,) = _placeholder_dim0_sym_names(ep_legacy.graph_module)
         self.assertExpectedInline(
             str(ep_legacy).strip(),
             f"""\
