@@ -251,6 +251,10 @@ inplace_buffers = True
 # reuse a buffer for an unrelated purpose
 allow_buffer_reuse = True
 
+# Keep explicit fuse regions as buffer reuse boundaries by default.
+# Callers that do not use them as lifetime boundaries can opt back in.
+allow_buffer_reuse_across_fuse_regions = False
+
 # Enable pooled allocations for non-output tensors
 memory_planning = os.environ.get("TORCHINDUCTOR_MEMORY_PLANNING", "0") == "1"
 
