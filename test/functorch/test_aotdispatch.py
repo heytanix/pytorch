@@ -9983,6 +9983,103 @@ def forward(self, primals_1, tangents_1):
         self.assertEqual(len(rebuilt_cd.args) - 2, 1)
         new_graph.lint()
 
+    def test_extract_graph_control_deps_preserves_subgraph_operation(self):
+        """When the original subgraph contains a side-effecting operation
+        whose inputs are all valid, the rebuilt control_deps must preserve
+        that operation rather than replacing with a passthrough-only graph."""
+        import torch.fx as fx
+        from torch._functorch._aot_autograd.descriptors import DummyAOTOutput
+        from torch._functorch.partitioners import _extract_graph_with_inputs_outputs
+        from torch._inductor.fx_passes.control_dependencies import (
+            control_deps as control_deps_hop,
+        )
+
+        joint_graph = fx.Graph()
+        mod = torch.nn.Module()
+
+        fwd_input = joint_graph.placeholder("primals_0")
+        fwd_input.meta = {"val": torch.randn(4)}
+        bw_input = joint_graph.placeholder("tangents_0")
+        bw_input.meta = {"val": torch.randn(4)}
+
+        fwd_val = joint_graph.call_function(torch.ops.aten.sin.default, (fwd_input,))
+        fwd_val.meta = {"val": torch.randn(4)}
+        bw_val = joint_graph.call_function(torch.ops.aten.cos.default, (bw_input,))
+        bw_val.meta = {"val": torch.randn(4)}
+
+        # Subgraph with a side-effecting op: abs(dep_0) as the result,
+        # plus passthrough of both deps.
+        # (dep_0, dep_1) -> (abs(dep_0), dep_0, dep_1)
+        sg = fx.Graph()
+        sg_ph0 = sg.placeholder("dep_0")
+        sg_ph1 = sg.placeholder("dep_1")
+        op_result = sg.call_function(torch.ops.aten.abs.default, (sg_ph0,))
+        sg.output((op_result, sg_ph0, sg_ph1))
+        sg_name = "_test_cd_subgraph_with_op"
+        setattr(mod, sg_name, fx.GraphModule(torch.nn.Module(), sg))
+        joint_graph.owning_module = mod  # type: ignore[assignment]
+
+        sg_node = joint_graph.get_attr(sg_name)
+        sg_node.meta = {}
+
+        # dep_0 = fwd_val (valid), dep_1 = bw_val (invalid)
+        cd_node = joint_graph.call_function(
+            control_deps_hop,
+            args=((), sg_node, fwd_val, bw_val),
+        )
+        cd_node.meta = {"val": (torch.randn(4), torch.randn(4), torch.randn(4))}
+
+        gi_op = joint_graph.call_function(operator.getitem, (cd_node, 0))
+        gi_op.meta = {"val": torch.randn(4)}
+        gi_fwd = joint_graph.call_function(operator.getitem, (cd_node, 1))
+        gi_fwd.meta = {"val": torch.randn(4)}
+        gi_bw = joint_graph.call_function(operator.getitem, (cd_node, 2))
+        gi_bw.meta = {"val": torch.randn(4)}
+
+        fwd_out = joint_graph.call_function(torch.ops.aten.add.Tensor, (gi_op, gi_fwd))
+        fwd_out.meta = {"val": torch.randn(4)}
+        joint_graph.output((fwd_out,))
+
+        inputs = [fwd_input]
+        outputs = [fwd_out]
+        outputs_descs = [DummyAOTOutput(0)]
+
+        new_graph = _extract_graph_with_inputs_outputs(
+            joint_graph,
+            inputs,
+            outputs,
+            outputs_descs,
+            ignore_must_be_in_fw_bw=True,
+        )
+
+        # The rebuilt subgraph should still contain the abs operation.
+        cd_nodes = [
+            n
+            for n in new_graph.nodes
+            if n.op == "call_function" and n.target is control_deps_hop
+        ]
+        self.assertEqual(len(cd_nodes), 1)
+        rebuilt_cd = cd_nodes[0]
+        sg_attr = rebuilt_cd.args[1]
+        self.assertEqual(sg_attr.op, "get_attr")
+        rebuilt_sg_mod = getattr(mod, sg_attr.target)
+        sg_ops = [n for n in rebuilt_sg_mod.graph.nodes if n.op == "call_function"]
+        self.assertEqual(len(sg_ops), 1)
+        self.assertEqual(sg_ops[0].target, torch.ops.aten.abs.default)
+
+        # getitem(cd, 0) (operation result) and getitem(cd, 1) (forward dep)
+        # should both be present; getitem(cd, 2) (backward) should be dropped.
+        gi_nodes = [
+            n
+            for n in new_graph.nodes
+            if n.op == "call_function" and n.target is operator.getitem
+        ]
+        gi_indices = sorted(n.args[1] for n in gi_nodes)
+        self.assertIn(0, gi_indices)
+        self.assertIn(1, gi_indices)
+        self.assertNotIn(2, gi_indices)
+        new_graph.lint()
+
 
 class TestAOTDispatch(AOTTestCase):
     # Tests to add cases for (non-exhaustive list, mostly for my notes):

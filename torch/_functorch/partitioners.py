@@ -298,6 +298,62 @@ def _find_input_for_invalid_output(
     return None
 
 
+def _try_clone_subgraph_filtering_deps(
+    original_sg_mod: fx.GraphModule,
+    valid_dep_set: OrderedSet[int],
+) -> fx.Graph | None:
+    """Clone a control_deps subgraph, keeping only valid-dep placeholders.
+
+    Preserves any call_function nodes (the side-effecting operation) as long
+    as all placeholders they reference are in valid_dep_set.  Returns None if
+    the operation uses an invalid dep or the subgraph cannot be analysed.
+    """
+    orig_phs = [n for n in original_sg_mod.graph.nodes if n.op == "placeholder"]
+
+    # If the operation references an invalid placeholder we cannot preserve it.
+    for n in original_sg_mod.graph.nodes:
+        if n.op == "call_function":
+            for leaf in pytree.arg_tree_leaves(*n.args, **n.kwargs):
+                if (
+                    isinstance(leaf, fx.Node)
+                    and leaf.op == "placeholder"
+                    and orig_phs.index(leaf) not in valid_dep_set
+                ):
+                    return None
+
+    sg = fx.Graph()
+    sg_env: dict[fx.Node, fx.Node] = {}
+
+    for i, ph in enumerate(orig_phs):
+        if i in valid_dep_set:
+            new_ph = sg.placeholder(ph.name)
+            new_ph.meta = ph.meta.copy() if ph.meta else {}
+            sg_env[ph] = new_ph
+
+    for n in original_sg_mod.graph.nodes:
+        if n.op in ("placeholder", "output"):
+            continue
+        sg_env[n] = sg.node_copy(n, lambda x, _env=sg_env: _env[x])
+
+    orig_output = next(n for n in original_sg_mod.graph.nodes if n.op == "output")
+    orig_out_arg = orig_output.args[0]
+    if isinstance(orig_out_arg, tuple):
+        new_out = []
+        for item in orig_out_arg:
+            if isinstance(item, fx.Node):
+                if item in sg_env:
+                    new_out.append(sg_env[item])
+            else:
+                new_out.append(item)
+        sg.output(tuple(new_out))
+    elif isinstance(orig_out_arg, fx.Node) and orig_out_arg in sg_env:
+        sg.output(sg_env[orig_out_arg])
+    else:
+        sg.output(orig_out_arg)
+
+    return sg
+
+
 def _rebuild_control_deps_for_extract(
     node: fx.Node,
     env: dict[fx.Node, Any],
@@ -313,7 +369,7 @@ def _rebuild_control_deps_for_extract(
     remain.
 
     additional_deps (args[0]) and passthrough deps (args[2:]) are filtered
-    independently — additional_deps are ordering-only constraints and may
+    independently -- additional_deps are ordering-only constraints and may
     reference nodes that are not in the passthrough set.
     """
     deps = node.args[2:]
@@ -343,14 +399,29 @@ def _rebuild_control_deps_for_extract(
     else:
         valid_additional_deps = ()
 
-    # Create a new subgraph compatible with the reduced passthrough arity.
-    # The original subgraph may have fixed-arity placeholders that would
-    # reject a shorter arg list, so we build a fresh (*deps)->(None, *deps)
-    # passthrough subgraph and register it on the owning module.
     owning_mod = joint_graph.owning_module
-    sg = fx.Graph()
-    sg_placeholders = [sg.placeholder(f"dep_{i}") for i in range(len(new_deps))]
-    sg.output((None, *sg_placeholders))
+    valid_dep_set = OrderedSet(valid_dep_indices)
+
+    # Try to clone the original subgraph preserving its side-effecting
+    # operation (e.g. stream sync) while filtering invalid deps.
+    sg: fx.Graph | None = None
+    sg_node = node.args[1]
+    if (
+        isinstance(sg_node, fx.Node)
+        and sg_node.op == "get_attr"
+        and isinstance(sg_node.target, str)
+        and owning_mod is not None
+    ):
+        original_sg_mod = getattr(owning_mod, sg_node.target, None)
+        if original_sg_mod is not None and isinstance(original_sg_mod, fx.GraphModule):
+            sg = _try_clone_subgraph_filtering_deps(original_sg_mod, valid_dep_set)
+
+    preserved_op = sg is not None and any(n.op == "call_function" for n in sg.nodes)
+    if sg is None:
+        sg = fx.Graph()
+        sg_placeholders = [sg.placeholder(f"dep_{i}") for i in range(len(new_deps))]
+        sg.output((None, *sg_placeholders))
+
     sg_name = "_cd_extract_subgraph"
     if owning_mod is not None:
         counter = 0
@@ -377,6 +448,8 @@ def _rebuild_control_deps_for_extract(
         )
 
     idx_remap = {old_i + 1: new_j + 1 for new_j, old_i in enumerate(valid_dep_indices)}
+    if preserved_op:
+        idx_remap[0] = 0
     return new_cd, idx_remap
 
 
