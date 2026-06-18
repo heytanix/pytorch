@@ -1875,10 +1875,12 @@ class TestProfiler(TestCase):
 
     def test_profiler_correlation_id(self):
         """
-        We expect the correlation_id to be unique across multiple invocation of the profiler,
-        So we will reuse id_uniqueness_set.
+        Correlation ids must be unique within a single profiling session so CPU
+        launch records can be matched to their GPU kernel records. They are not
+        required to be unique across sessions: older CUPTI used a process-global
+        monotonic counter, but newer CUPTI resets the counter per session, so we
+        check uniqueness per profile() invocation.
         """
-        id_uniqueness_set = set()
         model = torch.nn.Sequential(
             nn.Conv2d(16, 33, 18),
             nn.ReLU(),
@@ -1888,6 +1890,7 @@ class TestProfiler(TestCase):
         inputs = torch.randn(40, 16, 18, 260)
         uint32_max = 2**32 - 1
         for _ in range(5):
+            id_uniqueness_set = set()
             with profile() as prof:
                 model(inputs)
             for event in prof.profiler.kineto_results.events():
