@@ -592,8 +592,6 @@ Range constraints: {u0: VR[0, int_oo]}""",
             ignore_empty_lines=True,
         )
 
-
-
     def test_user_varargs_in_forward_marked_dynamic_via_varargs_spec(self):
         class M(torch.nn.Module):
             def forward(self, *args):
@@ -926,6 +924,7 @@ class <lambda>(torch.nn.Module):
 
 class TestExportDynamicSpecStrict(_TestExportDynamicSpecBase):
     strict = True
+
 
 class TestExportDynamicSpecNonStrict(_TestExportDynamicSpecBase):
     strict = False
