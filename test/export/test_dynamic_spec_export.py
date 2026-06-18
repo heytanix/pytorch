@@ -126,6 +126,27 @@ Range constraints: {u0: VR[0, int_oo]}""",
         ep.module()(torch.randn(16, 3))
         ep.module()(torch.randn(32, 3))
 
+    def test_static_int_spec_mismatch_raises(self):
+        # Source-name format differs: strict uses dynamo's flat-args path,
+        # non-strict uses pytree keypath sources.
+        if self.strict:
+            regex = (
+                r"shapes_spec declared L\['flat_args'\]\[1\] as static with "
+                r"value 10, but while tracing we found that it was actually 42"
+            )
+        else:
+            regex = (
+                r"shapes_spec declared L\['n'\] as static with value 10, "
+                r"but while tracing we found that it was actually 42"
+            )
+        with self.assertRaisesRegex(ValueError, regex):
+            export(
+                _ModXN(),
+                (torch.randn(4), 42),
+                dynamic_shapes=PARAMS({"n": 10}),
+                strict=self.strict,
+            )
+
     def test_static_tensor_dim_mismatch_raises(self):
         with self.assertRaisesRegex(
             ValueError,
@@ -157,6 +178,25 @@ Range constraints: {u0: VR[0, int_oo]}""",
             dynamic_shapes=PARAMS({"x": T([VAR("batch", min=10, max=100), STATIC])}),
             strict=self.strict,
         )
+
+    def test_unbacked_raises_dde_on_branching(self):
+        """Without min/max, branching on a ShapeVar dim raises a DDE.
+        Strict wraps it as UserError; non-strict raises the raw DDE.
+        """
+        exc = (
+            torch._dynamo.exc.UserError
+            if self.strict
+            else torch.fx.experimental.symbolic_shapes.GuardOnDataDependentSymNode
+        )
+        with self.assertRaisesRegex(
+            exc, r"Could not guard on data-dependent expression"
+        ):
+            export(
+                _ModBranch(),
+                (torch.randn(10, 3),),
+                dynamic_shapes=PARAMS({"x": T([VAR(), STATIC])}),
+                strict=self.strict,
+            )
 
     @_fx_experimental_config.patch(no_data_dependent_graph_break=True)
     def test_tensor_dim_optimization_hint_in_shape_env(self):
@@ -546,46 +586,6 @@ Range constraints: {u0: VR[0, int_oo], u1: VR[0, int_oo]}""",
         (vr,) = rcs.values()
         self.assertEqual(int(vr.lower), 10)
         self.assertEqual(int(vr.upper), 100)
-
-    def test_static_int_spec_mismatch_raises(self):
-        # Source-name format differs: strict uses dynamo's flat-args path,
-        # non-strict uses pytree keypath sources.
-        if self.strict:
-            regex = (
-                r"shapes_spec declared L\['flat_args'\]\[1\] as static with "
-                r"value 10, but while tracing we found that it was actually 42"
-            )
-        else:
-            regex = (
-                r"shapes_spec declared L\['n'\] as static with value 10, "
-                r"but while tracing we found that it was actually 42"
-            )
-        with self.assertRaisesRegex(ValueError, regex):
-            export(
-                _ModXN(),
-                (torch.randn(4), 42),
-                dynamic_shapes=PARAMS({"n": 10}),
-                strict=self.strict,
-            )
-
-    def test_unbacked_raises_dde_on_branching(self):
-        """Without min/max, branching on a ShapeVar dim raises a DDE.
-        Strict wraps it as UserError; non-strict raises the raw DDE.
-        """
-        exc = (
-            torch._dynamo.exc.UserError
-            if self.strict
-            else torch.fx.experimental.symbolic_shapes.GuardOnDataDependentSymNode
-        )
-        with self.assertRaisesRegex(
-            exc, r"Could not guard on data-dependent expression"
-        ):
-            export(
-                _ModBranch(),
-                (torch.randn(10, 3),),
-                dynamic_shapes=PARAMS({"x": T([VAR(), STATIC])}),
-                strict=self.strict,
-            )
 
     def test_export_to_torch_ir_shapes_spec_direct(self):
         # Strict-only internal-API test; skip in non-strict mode.
