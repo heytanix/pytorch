@@ -88,7 +88,7 @@ bypass_autograd_cache_key: bool = False
 
 # Whether or not to normalize placeholder names in graphs
 # from dynamo in AOTAutogradCache
-autograd_cache_normalize_inputs = not is_fbcode()
+autograd_cache_normalize_inputs = True
 
 # Enable debug mode at first invocation to check if custom ops are valid.
 # When enabled, this checks that custom operators don't violate aliasing constraints.
@@ -104,9 +104,12 @@ autograd_cache_normalize_inputs = not is_fbcode()
 #
 # Deprecated: Custom ops returning aliased outputs is deprecated and will
 # become an error in a future version of PyTorch. Currently error_on_custom_op_aliasing
-# is True only in CI.
+# is True in CI unless explicitly overridden.
 check_custom_op_aliasing = True
-error_on_custom_op_aliasing = bool(os.getenv("CI"))
+error_on_custom_op_aliasing: bool = Config(
+    env_name_force="TORCHINDUCTOR_ERROR_ON_CUSTOM_OP_ALIASING",
+    default=bool(os.getenv("CI")),
+)
 
 
 def remote_autograd_cache_default() -> bool | None:
