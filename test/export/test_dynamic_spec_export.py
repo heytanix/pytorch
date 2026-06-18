@@ -802,7 +802,7 @@ Range constraints: {u0: VR[0, int_oo]}""",
     def test_export_to_torch_ir_shapes_spec_direct(self):
         # Strict-only internal-API test; skip in non-strict mode.
         if not self.strict:
-            return
+            self.skipTest("strict-only internal-API test")
         gm = _export_to_torch_ir(
             _ModX(),
             (torch.randn(8, 3),),
@@ -828,7 +828,7 @@ class GraphModule(torch.nn.Module):
     def test_export_to_torch_ir_legacy_v1_shapes_spec_raises(self):
         # Strict-only internal-API test; skip in non-strict mode.
         if not self.strict:
-            return
+            self.skipTest("strict-only internal-API test")
         with mock.patch.object(
             torch._export.config, "use_new_tracer_experimental", False
         ):
@@ -846,7 +846,7 @@ class GraphModule(torch.nn.Module):
     def test_strict_export_shapes_spec_direct(self):
         # Strict-only internal-API test; skip in non-strict mode.
         if not self.strict:
-            return
+            self.skipTest("strict-only internal-API test")
         args = (torch.randn(8, 3),)
         _, in_spec = pytree.tree_flatten((args, {}))
         artifact = _strict_export(
@@ -878,7 +878,7 @@ class <lambda>(torch.nn.Module):
         # Verifies ``_non_strict_export`` with ``_to_aten_func=_export_to_aten_ir``
         # accepts ShapesSpec (replaces the old NotImplementedError gate test).
         if self.strict:
-            return
+            self.skipTest("non-strict-only internal-API test")
         args = (torch.randn(8, 3),)
         _, in_spec = pytree.tree_flatten((args, {}))
         artifact = _non_strict_export(
