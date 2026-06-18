@@ -355,6 +355,26 @@ def aot_dispatch_base_graph(
         updated_flat_args_subclasses_desugared_descs
     )
 
+    # Detect which inputs have shallow_copy_data_ mutations so
+    # the runtime replay uses the correct op instead of set_().
+    placeholders = [n for n in fw_module.graph.nodes if n.op == "placeholder"]
+    for node in fw_module.graph.nodes:
+        if (
+            node.op == "call_function"
+            and (
+                node.target is torch.ops.aten.shallow_copy_data_.default
+                or node.target is torch.ops.aten.shallow_copy_data_
+            )
+            and node.args
+            and node.args[0] in placeholders
+        ):
+            idx = placeholders.index(node.args[0])
+            if idx < len(fw_metadata.input_info):
+                fw_metadata.input_info[idx] = dataclasses.replace(
+                    fw_metadata.input_info[idx],
+                    mutation_is_shallow_copy_data=True,
+                )
+
     if aot_config.is_export and mod_when_exporting_non_strict is not None:
         # We update metadata to consider any assigned buffers as buffer mutations.
         i = len(dict(mod_when_exporting_non_strict.named_parameters()))

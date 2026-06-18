@@ -714,6 +714,9 @@ class OutputGraph(OutputGraphCommon):
 
         self.region_tracker = GraphRegionTracker()
         self._emit_debugger_breakpoint: bool = False
+        self._shallow_copy_placeholder_snapshots: list[
+            tuple[torch.fx.Node, torch.Tensor]
+        ] = []
 
         # tracked_fakes says where any tensor that was wrapped to fake came
         # from.  It is similar to GraphArg, in that all GraphArgs will get
@@ -2875,9 +2878,24 @@ class OutputGraph(OutputGraphCommon):
                 # a lot of fake_tensor ownership assumptions and runs afoul of detect_fake_mode
                 self.tracing_context.fake_mode = backend_fake_mode
 
+            example_inputs = self.example_inputs()
+
+            # Restore placeholder metadata mutated by
+            # in-graph shallow_copy_data_.
+            if self._shallow_copy_placeholder_snapshots:
+                placeholders = [n for n in gm.graph.nodes if n.op == "placeholder"]
+                for node, snapshot in self._shallow_copy_placeholder_snapshots:
+                    node.meta["example_value"] = snapshot
+                    if node in placeholders:
+                        idx = placeholders.index(node)
+                        if idx < len(example_inputs) and hasattr(
+                            example_inputs[idx], "fake_device"
+                        ):
+                            example_inputs[idx].fake_device = snapshot.fake_device  # type: ignore[union-attr]
+
             gm.graph.lint()
             with self.restore_global_state():
-                compiled_fn = self.call_user_compiler(gm, self.example_inputs())
+                compiled_fn = self.call_user_compiler(gm, example_inputs)
 
             from torch.fx._lazy_graph_module import _LazyGraphModule
 
