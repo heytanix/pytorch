@@ -453,17 +453,29 @@ def _make_fake_inputs_with_spec(
         if isinstance(x, torch.Tensor):
             if leaf_spec is None:
                 return fake_mode.from_tensor(x, static_shapes=True, source=source)
-            ctx = _symbolic_context_from_shapes_spec(x, source, leaf_spec, None, {})
+            ctx = _symbolic_context_from_shapes_spec(
+                x, source, leaf_spec, None, {}
+            )
             fake_x = fake_mode.from_tensor(
                 x, static_shapes=False, source=source, symbolic_context=ctx
             )
             _wire_tensor_spec_dims(leaf_spec, fake_x)
             return fake_x
         # NB: don't match on bools.
-        if type(x) is int and isinstance(leaf_spec, (IntVar, torch.SymInt)):
-            sym_node = shape_env.create_unbacked_symint(source=source)
-            _wire_spec_slot(leaf_spec, sym_node)
-            return sym_node
+        if type(x) is int:
+            if isinstance(leaf_spec, int):
+                # Static int spec: verify the runtime value matches.
+                if x != leaf_spec:
+                    raise ValueError(
+                        f"shapes_spec declared {source.name} as static with "
+                        f"value {leaf_spec}, but while tracing we found that "
+                        f"it was actually {x}"
+                    )
+                return x
+            if isinstance(leaf_spec, (IntVar, torch.SymInt)):
+                sym_node = shape_env.create_unbacked_symint(source=source)
+                _wire_spec_slot(leaf_spec, sym_node)
+                return sym_node
         return x
 
     # Wire assumptions BEFORE processing inputs so derived / assumption
