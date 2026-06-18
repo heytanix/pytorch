@@ -9685,6 +9685,304 @@ def forward(self, primals_1, tangents_1):
         with functorch_config.patch(unsafe_treat_script_objects_as_zero_size=True):
             self.assertEqual(_size_of(node), 0)
 
+    def test_extract_graph_control_deps_mixed_validity(self):
+        """When a control_deps node has both forward-valid and backward-only
+        deps, _extract_graph_with_inputs_outputs should rebuild the
+        control_deps with only the valid deps and remap getitem indices."""
+        import torch.fx as fx
+        from torch._functorch._aot_autograd.descriptors import DummyAOTOutput
+        from torch._functorch.partitioners import _extract_graph_with_inputs_outputs
+        from torch._inductor.fx_passes.control_dependencies import (
+            control_deps as control_deps_hop,
+        )
+
+        joint_graph = fx.Graph()
+        mod = torch.nn.Module()
+
+        fwd_input = joint_graph.placeholder("primals_0")
+        fwd_input.meta = {"val": torch.randn(4)}
+        bw_input = joint_graph.placeholder("tangents_0")
+        bw_input.meta = {"val": torch.randn(4)}
+
+        fwd_val = joint_graph.call_function(torch.ops.aten.sin.default, (fwd_input,))
+        fwd_val.meta = {"val": torch.randn(4)}
+        bw_val = joint_graph.call_function(torch.ops.aten.cos.default, (bw_input,))
+        bw_val.meta = {"val": torch.randn(4)}
+
+        # Build a passthrough subgraph that returns (None, dep0, dep1).
+        sg = fx.Graph()
+        sg_ph0 = sg.placeholder("dep_0")
+        sg_ph1 = sg.placeholder("dep_1")
+        sg.output((None, sg_ph0, sg_ph1))
+        sg_name = "_test_cd_subgraph"
+        setattr(mod, sg_name, fx.GraphModule(torch.nn.Module(), sg))
+        joint_graph.owning_module = mod  # type: ignore[assignment]
+
+        sg_node = joint_graph.get_attr(sg_name)
+        sg_node.meta = {}
+
+        cd_node = joint_graph.call_function(
+            control_deps_hop,
+            args=((), sg_node, fwd_val, bw_val),
+            kwargs={},
+        )
+        cd_node.meta = {"val": (None, torch.randn(4), torch.randn(4))}
+
+        gi_0 = joint_graph.call_function(operator.getitem, (cd_node, 0))
+        gi_0.meta = {"val": None}
+        gi_fwd = joint_graph.call_function(operator.getitem, (cd_node, 1))
+        gi_fwd.meta = {"val": torch.randn(4)}
+        gi_bw = joint_graph.call_function(operator.getitem, (cd_node, 2))
+        gi_bw.meta = {"val": torch.randn(4)}
+
+        fwd_out = joint_graph.call_function(torch.ops.aten.relu.default, (gi_fwd,))
+        fwd_out.meta = {"val": torch.randn(4)}
+
+        joint_graph.output((fwd_out,))
+
+        inputs = [fwd_input]
+        outputs = [fwd_out]
+        outputs_descs = [DummyAOTOutput(0)]
+
+        new_graph = _extract_graph_with_inputs_outputs(
+            joint_graph, inputs, outputs, outputs_descs, ignore_must_be_in_fw_bw=True
+        )
+
+        # The extracted graph should contain a control_deps node with only the
+        # forward dep (fwd_val).  The backward dep (bw_val) should be dropped.
+        cd_nodes = [
+            n
+            for n in new_graph.nodes
+            if n.op == "call_function" and n.target is control_deps_hop
+        ]
+        self.assertEqual(len(cd_nodes), 1, "Expected exactly one control_deps node")
+        rebuilt_cd = cd_nodes[0]
+        # args layout: (additional_deps, subgraph, *deps)
+        # Only the forward dep should survive.
+        self.assertEqual(len(rebuilt_cd.args) - 2, 1)
+
+        # getitem(cd, 1) from the original graph (forward dep) should be
+        # remapped to getitem(rebuilt_cd, 1) in the new graph.
+        gi_nodes = [
+            n
+            for n in new_graph.nodes
+            if n.op == "call_function" and n.target is operator.getitem
+        ]
+        self.assertEqual(len(gi_nodes), 1)
+        self.assertEqual(gi_nodes[0].args[1], 1)
+
+        # getitem(cd, 2) (backward dep) should NOT appear in the new graph.
+        gi_indices = [n.args[1] for n in gi_nodes]
+        self.assertNotIn(2, gi_indices)
+
+        new_graph.lint()
+
+    def test_extract_graph_control_deps_all_invalid(self):
+        """When ALL deps of a control_deps are invalid, the entire node
+        (and downstream getitems) should be marked invalid and omitted."""
+        import torch.fx as fx
+        from torch._functorch._aot_autograd.descriptors import DummyAOTOutput
+        from torch._functorch.partitioners import _extract_graph_with_inputs_outputs
+        from torch._inductor.fx_passes.control_dependencies import (
+            control_deps as control_deps_hop,
+        )
+
+        joint_graph = fx.Graph()
+        mod = torch.nn.Module()
+
+        fwd_input = joint_graph.placeholder("primals_0")
+        fwd_input.meta = {"val": torch.randn(4)}
+        bw_input = joint_graph.placeholder("tangents_0")
+        bw_input.meta = {"val": torch.randn(4)}
+
+        bw_val = joint_graph.call_function(torch.ops.aten.cos.default, (bw_input,))
+        bw_val.meta = {"val": torch.randn(4)}
+
+        sg = fx.Graph()
+        sg_ph = sg.placeholder("dep_0")
+        sg.output((None, sg_ph))
+        sg_name = "_test_cd_subgraph"
+        setattr(mod, sg_name, fx.GraphModule(torch.nn.Module(), sg))
+        joint_graph.owning_module = mod  # type: ignore[assignment]
+
+        sg_node = joint_graph.get_attr(sg_name)
+        sg_node.meta = {}
+
+        cd_node = joint_graph.call_function(
+            control_deps_hop,
+            args=((), sg_node, bw_val),
+        )
+        cd_node.meta = {"val": (None, torch.randn(4))}
+
+        gi_bw = joint_graph.call_function(operator.getitem, (cd_node, 1))
+        gi_bw.meta = {"val": torch.randn(4)}
+
+        # Forward output does not depend on the control_deps at all.
+        fwd_out = joint_graph.call_function(torch.ops.aten.sin.default, (fwd_input,))
+        fwd_out.meta = {"val": torch.randn(4)}
+        joint_graph.output((fwd_out,))
+
+        inputs = [fwd_input]
+        outputs = [fwd_out]
+        outputs_descs = [DummyAOTOutput(0)]
+
+        new_graph = _extract_graph_with_inputs_outputs(
+            joint_graph, inputs, outputs, outputs_descs, ignore_must_be_in_fw_bw=True
+        )
+
+        cd_nodes = [
+            n
+            for n in new_graph.nodes
+            if n.op == "call_function" and n.target is control_deps_hop
+        ]
+        self.assertEqual(len(cd_nodes), 0, "control_deps should be dropped entirely")
+        new_graph.lint()
+
+    def test_extract_graph_control_deps_getitem_index_remap(self):
+        """Verify getitem index remapping when the first dep is invalid and
+        only later deps survive."""
+        import torch.fx as fx
+        from torch._functorch._aot_autograd.descriptors import DummyAOTOutput
+        from torch._functorch.partitioners import _extract_graph_with_inputs_outputs
+        from torch._inductor.fx_passes.control_dependencies import (
+            control_deps as control_deps_hop,
+        )
+
+        joint_graph = fx.Graph()
+        mod = torch.nn.Module()
+
+        fwd_input = joint_graph.placeholder("primals_0")
+        fwd_input.meta = {"val": torch.randn(4)}
+        bw_input = joint_graph.placeholder("tangents_0")
+        bw_input.meta = {"val": torch.randn(4)}
+
+        bw_val = joint_graph.call_function(torch.ops.aten.cos.default, (bw_input,))
+        bw_val.meta = {"val": torch.randn(4)}
+        fwd_val = joint_graph.call_function(torch.ops.aten.sin.default, (fwd_input,))
+        fwd_val.meta = {"val": torch.randn(4)}
+
+        # Subgraph with 2 deps: dep_0=bw_val (invalid), dep_1=fwd_val (valid).
+        sg = fx.Graph()
+        sg_ph0 = sg.placeholder("dep_0")
+        sg_ph1 = sg.placeholder("dep_1")
+        sg.output((None, sg_ph0, sg_ph1))
+        sg_name = "_test_cd_subgraph"
+        setattr(mod, sg_name, fx.GraphModule(torch.nn.Module(), sg))
+        joint_graph.owning_module = mod  # type: ignore[assignment]
+
+        sg_node = joint_graph.get_attr(sg_name)
+        sg_node.meta = {}
+
+        cd_node = joint_graph.call_function(
+            control_deps_hop,
+            args=((), sg_node, bw_val, fwd_val),
+        )
+        cd_node.meta = {"val": (None, torch.randn(4), torch.randn(4))}
+
+        # getitem(cd, 1) -> bw dep (invalid)
+        gi_bw = joint_graph.call_function(operator.getitem, (cd_node, 1))
+        gi_bw.meta = {"val": torch.randn(4)}
+        # getitem(cd, 2) -> fwd dep (valid), should be remapped to index 1
+        gi_fwd = joint_graph.call_function(operator.getitem, (cd_node, 2))
+        gi_fwd.meta = {"val": torch.randn(4)}
+
+        fwd_out = joint_graph.call_function(torch.ops.aten.relu.default, (gi_fwd,))
+        fwd_out.meta = {"val": torch.randn(4)}
+        joint_graph.output((fwd_out,))
+
+        inputs = [fwd_input]
+        outputs = [fwd_out]
+        outputs_descs = [DummyAOTOutput(0)]
+
+        new_graph = _extract_graph_with_inputs_outputs(
+            joint_graph, inputs, outputs, outputs_descs, ignore_must_be_in_fw_bw=True
+        )
+
+        gi_nodes = [
+            n
+            for n in new_graph.nodes
+            if n.op == "call_function" and n.target is operator.getitem
+        ]
+        # Only the forward getitem should survive, and its index should be
+        # remapped from 2 -> 1 (since dep_0 was dropped).
+        self.assertEqual(len(gi_nodes), 1)
+        self.assertEqual(gi_nodes[0].args[1], 1)
+        new_graph.lint()
+
+    def test_extract_graph_control_deps_additional_deps_filtered(self):
+        """additional_deps (args[0]) should be filtered independently: valid
+        additional deps are kept even if some passthrough deps are invalid."""
+        import torch.fx as fx
+        from torch._functorch._aot_autograd.descriptors import DummyAOTOutput
+        from torch._functorch.partitioners import _extract_graph_with_inputs_outputs
+        from torch._inductor.fx_passes.control_dependencies import (
+            control_deps as control_deps_hop,
+        )
+
+        joint_graph = fx.Graph()
+        mod = torch.nn.Module()
+
+        fwd_input = joint_graph.placeholder("primals_0")
+        fwd_input.meta = {"val": torch.randn(4)}
+        bw_input = joint_graph.placeholder("tangents_0")
+        bw_input.meta = {"val": torch.randn(4)}
+
+        fwd_val = joint_graph.call_function(torch.ops.aten.sin.default, (fwd_input,))
+        fwd_val.meta = {"val": torch.randn(4)}
+        bw_val = joint_graph.call_function(torch.ops.aten.cos.default, (bw_input,))
+        bw_val.meta = {"val": torch.randn(4)}
+        fwd_ordering_dep = joint_graph.call_function(
+            torch.ops.aten.abs.default, (fwd_input,)
+        )
+        fwd_ordering_dep.meta = {"val": torch.randn(4)}
+
+        sg = fx.Graph()
+        sg_ph0 = sg.placeholder("dep_0")
+        sg_ph1 = sg.placeholder("dep_1")
+        sg.output((None, sg_ph0, sg_ph1))
+        sg_name = "_test_cd_subgraph"
+        setattr(mod, sg_name, fx.GraphModule(torch.nn.Module(), sg))
+        joint_graph.owning_module = mod  # type: ignore[assignment]
+
+        sg_node = joint_graph.get_attr(sg_name)
+        sg_node.meta = {}
+
+        # additional_deps references fwd_ordering_dep (valid).
+        # passthrough deps: fwd_val (valid), bw_val (invalid).
+        cd_node = joint_graph.call_function(
+            control_deps_hop,
+            args=((fwd_ordering_dep,), sg_node, fwd_val, bw_val),
+        )
+        cd_node.meta = {"val": (None, torch.randn(4), torch.randn(4))}
+
+        gi_fwd = joint_graph.call_function(operator.getitem, (cd_node, 1))
+        gi_fwd.meta = {"val": torch.randn(4)}
+
+        fwd_out = joint_graph.call_function(torch.ops.aten.relu.default, (gi_fwd,))
+        fwd_out.meta = {"val": torch.randn(4)}
+        joint_graph.output((fwd_out,))
+
+        inputs = [fwd_input]
+        outputs = [fwd_out]
+        outputs_descs = [DummyAOTOutput(0)]
+
+        new_graph = _extract_graph_with_inputs_outputs(
+            joint_graph, inputs, outputs, outputs_descs, ignore_must_be_in_fw_bw=True
+        )
+
+        cd_nodes = [
+            n
+            for n in new_graph.nodes
+            if n.op == "call_function" and n.target is control_deps_hop
+        ]
+        self.assertEqual(len(cd_nodes), 1)
+        rebuilt_cd = cd_nodes[0]
+        # additional_deps should contain the valid ordering dep.
+        self.assertEqual(len(rebuilt_cd.args[0]), 1)
+        # Only 1 passthrough dep (fwd_val) should remain.
+        self.assertEqual(len(rebuilt_cd.args) - 2, 1)
+        new_graph.lint()
+
 
 class TestAOTDispatch(AOTTestCase):
     # Tests to add cases for (non-exhaustive list, mostly for my notes):

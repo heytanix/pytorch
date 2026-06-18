@@ -34,6 +34,9 @@ from torch._inductor.custom_graph_pass import (
     CustomKnapsackSolver,
     CustomRuntimeEstimator,
 )
+from torch._inductor.fx_passes.control_dependencies import (
+    control_deps as control_deps_hop,
+)
 from torch._library.fake_class_registry import FakeScriptObject
 from torch._library.opaque_object import is_opaque_value
 from torch._library.utils import is_builtin
@@ -295,6 +298,88 @@ def _find_input_for_invalid_output(
     return None
 
 
+def _rebuild_control_deps_for_extract(
+    node: fx.Node,
+    env: dict[fx.Node, Any],
+    new_graph: fx.Graph,
+    joint_graph: fx.Graph,
+) -> tuple[fx.Node, dict[int, int]] | None:
+    """Rebuild a control_deps node with only valid deps for graph extraction.
+
+    When a control_deps node mixes valid (forward) and invalid (backward) args,
+    this creates a new control_deps in new_graph with only the valid passthrough
+    deps and a matching subgraph.  Returns (new_node, idx_remap) where idx_remap
+    maps old getitem indices to new getitem indices, or None if no valid deps
+    remain.
+
+    additional_deps (args[0]) and passthrough deps (args[2:]) are filtered
+    independently — additional_deps are ordering-only constraints and may
+    reference nodes that are not in the passthrough set.
+    """
+    deps = node.args[2:]
+    valid_dep_nodes: list[fx.Node] = [
+        dep  # type: ignore[misc]
+        for dep in deps
+        if isinstance(dep, fx.Node) and not isinstance(env.get(dep), InvalidNodeBase)
+    ]
+    valid_dep_indices = [
+        i
+        for i, dep in enumerate(deps)
+        if isinstance(dep, fx.Node) and not isinstance(env.get(dep), InvalidNodeBase)
+    ]
+    if not valid_dep_indices:
+        return None
+
+    new_deps = tuple(env[d] for d in valid_dep_nodes)
+
+    # Filter additional_deps independently from passthrough deps.
+    orig_additional_deps = node.args[0]
+    if isinstance(orig_additional_deps, (tuple, list)):
+        valid_additional_deps = tuple(
+            env[d]
+            for d in orig_additional_deps
+            if isinstance(d, fx.Node) and not isinstance(env.get(d), InvalidNodeBase)
+        )
+    else:
+        valid_additional_deps = ()
+
+    # Create a new subgraph compatible with the reduced passthrough arity.
+    # The original subgraph may have fixed-arity placeholders that would
+    # reject a shorter arg list, so we build a fresh (*deps)->(None, *deps)
+    # passthrough subgraph and register it on the owning module.
+    owning_mod = joint_graph.owning_module
+    sg = fx.Graph()
+    sg_placeholders = [sg.placeholder(f"dep_{i}") for i in range(len(new_deps))]
+    sg.output((None, *sg_placeholders))
+    sg_name = "_cd_extract_subgraph"
+    if owning_mod is not None:
+        counter = 0
+        actual_name = sg_name
+        while hasattr(owning_mod, actual_name):
+            actual_name = f"{sg_name}_{counter}"
+            counter += 1
+        sg_name = actual_name
+        setattr(owning_mod, sg_name, fx.GraphModule(torch.nn.Module(), sg))
+    new_sg_node = new_graph.get_attr(sg_name)
+
+    new_cd = new_graph.create_node(
+        "call_function",
+        control_deps_hop,
+        args=(valid_additional_deps, new_sg_node, *new_deps),
+        name=node.name,
+    )
+    new_cd.meta = node.meta.copy()
+    # Update val to reflect the new tuple size.
+    if "val" in node.meta and isinstance(node.meta["val"], tuple):
+        orig_val = node.meta["val"]
+        new_cd.meta["val"] = (orig_val[0],) + tuple(
+            orig_val[i + 1] for i in valid_dep_indices if i + 1 < len(orig_val)
+        )
+
+    idx_remap = {old_i + 1: new_j + 1 for new_j, old_i in enumerate(valid_dep_indices)}
+    return new_cd, idx_remap
+
+
 def _extract_graph_with_inputs_outputs(
     joint_graph: fx.Graph,
     inputs: list[fx.Node],
@@ -315,6 +400,11 @@ def _extract_graph_with_inputs_outputs(
     """
     new_graph = fx.Graph()
     env: dict[fx.Node, fx.Node] = {}
+    # For control_deps nodes with mixed valid/invalid args, we create a new
+    # control_deps with only the valid deps.  This dict maps the original
+    # control_deps node to a {old_getitem_idx: new_getitem_idx} remapping so
+    # downstream getitem nodes can be rewritten to the correct indices.
+    _control_deps_idx_remap: dict[fx.Node, dict[int, int]] = {}
 
     # Add new placeholder nodes in the order specified by the inputs
     for node in inputs:
@@ -350,6 +440,34 @@ def _extract_graph_with_inputs_outputs(
         elif node.op == "placeholder":
             env[node] = InvalidNode  # type: ignore[assignment]
         elif node.op == "call_function":
+            # For getitem on a remapped control_deps, rewrite the index and
+            # check per-element validity.  control_deps args layout:
+            # (additional_deps, subgraph, *deps).  Subgraph returns
+            # (wait_result, *deps), so getitem index k (k>=1) corresponds
+            # to the (k-1)th dep.  Index 0 is the wait_stream side-effect
+            # result (None) which has no data dependency to preserve.
+            if (
+                node.target is operator.getitem
+                and isinstance(node.args[0], fx.Node)
+                and isinstance(node.args[1], int)
+                and node.args[0] in _control_deps_idx_remap
+            ):
+                idx_map = _control_deps_idx_remap[node.args[0]]
+                old_idx = node.args[1]
+                if old_idx in idx_map:
+                    new_idx = idx_map[old_idx]
+                    new_getitem = new_graph.create_node(
+                        "call_function",
+                        operator.getitem,
+                        args=(env[node.args[0]], new_idx),
+                        name=node.name,
+                    )
+                    new_getitem.meta = node.meta
+                    env[node] = new_getitem
+                else:
+                    env[node] = InvalidNode  # type: ignore[assignment]
+                continue
+
             all_args = pytree.arg_tree_leaves(*node.args, **node.kwargs)
             all_args = [
                 isinstance(env[x], InvalidNodeBase)
@@ -357,6 +475,14 @@ def _extract_graph_with_inputs_outputs(
                 if isinstance(x, fx.Node)
             ]
             if any(all_args):
+                if node.target is control_deps_hop:
+                    new_cd_node = _rebuild_control_deps_for_extract(
+                        node, env, new_graph, joint_graph
+                    )
+                    if new_cd_node is not None:
+                        env[node] = new_cd_node[0]
+                        _control_deps_idx_remap[node] = new_cd_node[1]
+                        continue
                 env[node] = InvalidNode  # type: ignore[assignment]
                 continue
             # pyrefly: ignore [unsupported-operation, bad-argument-type]
@@ -3717,7 +3843,25 @@ def classify_nodes(
             required_bw_nodes.add(node)
 
         if node in required_bw_nodes:
-            required_bw_nodes.update(node.users)
+            if node.op == "call_function" and node.target is control_deps_hop:
+                # control_deps mixes forward and backward deps.  Only
+                # propagate required_bw to getitem users that extract a
+                # backward-only dep.  getitem(cd, k) with k>=1 maps to
+                # deps[k-1] (args[k+1]).
+                deps = node.args[2:]
+                for user in node.users:
+                    if (
+                        user.target is operator.getitem
+                        and isinstance(user.args[1], int)
+                        and 1 <= user.args[1] <= len(deps)
+                    ):
+                        dep = deps[user.args[1] - 1]
+                        if isinstance(dep, fx.Node) and dep in required_bw_nodes:
+                            required_bw_nodes.add(user)
+                    else:
+                        required_bw_nodes.add(user)
+            else:
+                required_bw_nodes.update(node.users)
 
     primal_inputs = list(filter(_is_primal, joint_module.graph.nodes))
     fwd_seed_offset_inputs = list(filter(_is_fwd_seed_offset, joint_module.graph.nodes))
@@ -3741,7 +3885,7 @@ def classify_nodes(
     required_fw_nodes: OrderedSet[fx.Node] = OrderedSet(
         name_to_node[node.name]
         for node in forward_only_graph.nodes
-        if node.op != "output"
+        if node.op != "output" and node.name in name_to_node
     )
     unclaimed_nodes: OrderedSet[fx.Node] = OrderedSet(
         node
