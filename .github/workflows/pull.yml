@@ -231,18 +231,20 @@ jobs:
   # of this workflow to conclude.
 
   test-diff:
+    if: ${{ needs.job-filter.outputs.jobs == '' || contains(needs.job-filter.outputs.jobs, ' test-diff ') }}
     name: test-diff
     uses: ./.github/workflows/_test-diff.yml
     needs:
       - linux-jammy-py3_10-gcc11-build
       - get-label-type
+      - job-filter
     with:
       build-environment: ${{ needs.linux-jammy-py3_10-gcc11-build.outputs.build-environment }}
       docker-image: ${{ needs.linux-jammy-py3_10-gcc11-build.outputs.docker-image }}
       runner_prefix: "${{ needs.get-label-type.outputs.label-type }}"
-      # mps/xpu simulation from a CPU wheel is unvalidated (needs a Mac/Intel-GPU
-      # runner to confirm); start with the reliably-simulatable set.
-      platforms: "linux-cpu,linux-cuda-sm80,linux-cuda-sm90,linux-rocm"
+      # mps is validated against a real Mac (the descriptor stubs the macOS-only
+      # probes); xpu simulation is pending validation on real Intel-GPU hardware.
+      platforms: "linux-cpu,linux-cuda-sm80,linux-cuda-sm90,linux-rocm,macos-mps"
     secrets: inherit
 
   # TEMPORARY (pre-land testing only): posts the test-diff comment from the PR branch

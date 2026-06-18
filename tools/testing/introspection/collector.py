@@ -103,6 +103,7 @@ def apply_descriptor(platform: Platform) -> None:
             torch.backends.mps.is_built = lambda: True
         cdt.TEST_MPS = True
         cu.TEST_MPS = True
+        _stub_macos_probes()
         cdt.device_type_test_bases = [cdt.CPUTestBase]
         return
 
@@ -126,6 +127,36 @@ def apply_descriptor(platform: Platform) -> None:
         return
 
     raise ValueError(f"unsupported device_type {platform.device_type!r}")
+
+
+def _stub_macos_probes() -> None:
+    # test_mps.py reads total RAM at import via `sysctl -n hw.memsize` (macOS-only),
+    # which errors on a non-Mac simulation host. Fake just that probe; pass the rest
+    # through. The value only feeds test sizing heuristics, never a real allocation.
+    import torch
+
+    real = subprocess.check_output
+
+    def fake(cmd, *args, **kwargs):
+        # Only substitute when the real (macOS-only) probe is unavailable, so this is a
+        # strict no-op on an actual Mac.
+        if isinstance(cmd, (list, tuple)) and "hw.memsize" in cmd:
+            try:
+                return real(cmd, *args, **kwargs)
+            except Exception:
+                return b"17179869184"  # 16 GiB
+        return real(cmd, *args, **kwargs)
+
+    subprocess.check_output = fake
+
+    # MPS C APIs are macOS-only and absent from a non-Mac build; fake the ones test
+    # files call at import/decorator time (in method bodies they don't run here).
+    for name, ret in {
+        "_mps_isCaptureEnabled": False,
+        "_mps_maxBufferLength": 1 << 34,
+    }.items():
+        if not hasattr(torch._C, name):
+            setattr(torch._C, name, (lambda r: lambda *a, **k: r)(ret))
 
 
 def _patch_has_triton() -> None:
