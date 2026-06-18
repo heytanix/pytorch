@@ -8,7 +8,14 @@ file with the validation commit.
 """
 
 import sys
+from pathlib import Path
 
+
+# Run by path (python tools/.../_validate_device.py), so the package root isn't on
+# sys.path. Append it (not prepend) so `tools` imports while the wheel torch in
+# site-packages stays ahead of any repo torch/ source -- same bootstrap as collector.py.
+if not __package__:
+    sys.path.append(str(Path(__file__).resolve().parents[3]))
 
 sys.path.insert(0, "test")  # let test files resolve sibling imports
 
