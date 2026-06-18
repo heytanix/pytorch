@@ -129,16 +129,11 @@ Range constraints: {u0: VR[0, int_oo]}""",
     def test_static_int_spec_mismatch_raises(self):
         # Source-name format differs: strict uses dynamo's flat-args path,
         # non-strict uses pytree keypath sources.
-        if self.strict:
-            regex = (
-                r"shapes_spec declared L\['flat_args'\]\[1\] as static with "
-                r"value 10, but got 42 at trace time"
-            )
-        else:
-            regex = (
-                r"shapes_spec declared L\['n'\] as static with value 10, "
-                r"but got 42 at trace time"
-            )
+        source = r"L\['flat_args'\]\[1\]" if self.strict else r"L\['n'\]"
+        regex = (
+            rf"shapes_spec declared {source} as static with value 10, "
+            r"but got 42 at trace time"
+        )
         with self.assertRaisesRegex(ValueError, regex):
             export(
                 _ModXN(),

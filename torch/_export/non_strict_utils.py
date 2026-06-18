@@ -429,74 +429,19 @@ def _make_fake_inputs_with_spec(
     dynamic_shapes: Any,
     original_signature: inspect.Signature,
 ) -> tuple[FakeTensorMode, Any, Any, EqualityConstraint, inspect.Signature, Any]:
-    from torch.fx.experimental._spec_binding import _bind_spec_to_args
-    from torch.fx.experimental.dynamic_spec import (
-        _coerce_to_shapes_spec,
-        IntVar,
-        ShapesSpec,
-    )
-    from torch.fx.experimental.symbolic_shapes import (
-        _finalize_spec_wiring,
-        _symbolic_context_from_shapes_spec,
-        _wire_spec_assumptions,
-        _wire_spec_slot,
-        _wire_tensor_spec_dims,
-    )
+    from torch.fx.experimental.dynamic_spec import _coerce_to_shapes_spec, ShapesSpec
+    from torch.fx.experimental.symbolic_shapes import _fakify_inputs_with_spec
 
     user_spec = cast(ShapesSpec, _coerce_to_shapes_spec(dynamic_shapes))
-    shape_env = fake_mode.shape_env
-    if shape_env is None:
-        raise AssertionError("fake_mode.shape_env must not be None")
 
-    def _fakify_one_leaf(x: Any, source: Source, leaf_spec: Any) -> Any:
-        """Fakify a single flat input leaf against its (already-bound) spec."""
-        if isinstance(x, torch.Tensor):
-            if leaf_spec is None:
-                return fake_mode.from_tensor(x, static_shapes=True, source=source)
-            ctx = _symbolic_context_from_shapes_spec(x, source, leaf_spec, None, {})
-            fake_x = fake_mode.from_tensor(
-                x, static_shapes=False, source=source, symbolic_context=ctx
-            )
-            _wire_tensor_spec_dims(leaf_spec, fake_x)
-            return fake_x
-        # NB: don't match on bools.
-        if type(x) is int:
-            if isinstance(leaf_spec, int):
-                # Static int spec: verify the runtime value matches.
-                if x != leaf_spec:
-                    raise ValueError(
-                        f"shapes_spec declared {source.name} as static with "
-                        f"value {leaf_spec}, but got {x} at trace time"
-                    )
-                return x
-            if isinstance(leaf_spec, (IntVar, torch.SymInt)):
-                sym_node = shape_env.create_unbacked_symint(source=source)
-                _wire_spec_slot(leaf_spec, sym_node)
-                return sym_node
-        return x
-
-    # Wire assumptions BEFORE processing inputs so derived / assumption
-    # checks can drain as inputs bind.
-    if user_spec._assumptions:
-        _wire_spec_assumptions(shape_env, user_spec)
-
-    leaf_specs, flat_args, in_spec = _bind_spec_to_args(
-        nn_module, args, kwargs, user_spec
+    fake_leaves, _flat_args, in_spec = _fakify_inputs_with_spec(
+        fake_mode,
+        nn_module,
+        args,
+        kwargs,
+        user_spec=user_spec,
+        sourced_prefixes=sourced_prefixes,
     )
-    leaf_sources = [
-        key_path_to_source(kp, sourced_prefixes=sourced_prefixes)
-        for kp, _ in pytree.tree_flatten_with_path((args, kwargs))[0]
-    ]
-
-    with shape_env.ignore_fresh_unbacked_symbols():
-        fake_leaves = [
-            _fakify_one_leaf(x, leaf_sources[i], leaf_specs[i])
-            for i, x in enumerate(flat_args)
-        ]
-
-    # Verify every spec assumption / derived check that survived input
-    # processing has been emitted.
-    _finalize_spec_wiring(shape_env)
 
     fake_args, fake_kwargs = pytree.tree_unflatten(fake_leaves, in_spec)
     equalities_inputs = EqualityConstraint(

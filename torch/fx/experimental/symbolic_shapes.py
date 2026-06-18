@@ -9446,3 +9446,104 @@ def _finalize_spec_wiring(shape_env: ShapeEnv) -> None:
         f"bare-IntVar slot somewhere in the spec. Offending checks:\n"
         + "\n".join(lines)
     )
+
+
+def _fakify_inputs_with_spec(
+    fake_mode: Any,
+    fn: Any,
+    args: Any,
+    kwargs: Any,
+    *,
+    user_spec: Any,
+    sourced_prefixes: Any = None,
+    use_backed_for_ints: bool = False,
+    fakify_other: Any = None,
+) -> tuple[list[Any], list[Any], Any]:
+    """Shared spec-driven fakify orchestration. Returns
+    ``(fake_leaves, flat_args, in_spec)``.
+
+    Wires ``user_spec`` assumptions, binds the spec to ``(args, kwargs)``,
+    builds keypath-style ``Source`` for each leaf (via ``key_path_to_source``),
+    fakifies each leaf, and finalizes pending spec checks.
+
+    Per-leaf:
+      - ``torch.Tensor``: no spec -> fully-static fake tensor; with spec -> spec-driven
+        ``SymbolicContext`` + ``_wire_tensor_spec_dims``.
+      - ``int``: static-int spec -> verify match; ``IntVar``/``SymInt`` spec -> unbacked
+        symbol + ``_wire_spec_slot``; otherwise pass through (or, if
+        ``use_backed_for_ints``, allocate a backed size-like symbol -- only
+        ``make_fx(tracing_mode='symbolic')`` sets this).
+      - anything else: ``fakify_other(x, source)`` if provided (used by make_fx
+        for ``ScriptObject``/``FakeScriptObject``), else pass through.
+
+    Shared by make_fx (``_MakefxTracer._convert_args_to_fake``) and non-strict
+    export (``torch._export.non_strict_utils.make_fake_inputs``).
+    """
+    import torch.utils._pytree as pytree
+
+    from torch._export.non_strict_utils import key_path_to_source
+    from torch.fx.experimental._spec_binding import _bind_spec_to_args
+    from torch.fx.experimental.dynamic_spec import IntVar
+
+    shape_env = fake_mode.shape_env
+    if shape_env is None:
+        raise AssertionError("fake_mode.shape_env must not be None for spec path")
+
+    if user_spec._assumptions:
+        _wire_spec_assumptions(shape_env, user_spec)
+
+    leaf_specs, flat_args, in_spec = _bind_spec_to_args(
+        fn, args, kwargs, user_spec
+    )
+    leaf_sources = [
+        key_path_to_source(kp, sourced_prefixes=sourced_prefixes)
+        for kp, _ in pytree.tree_flatten_with_path((args, kwargs))[0]
+    ]
+
+    def _fakify(x: Any, source: Any, leaf_spec: Any) -> Any:
+        if isinstance(x, torch.Tensor):
+            if leaf_spec is None:
+                return fake_mode.from_tensor(x, static_shapes=True, source=source)
+            ctx = _symbolic_context_from_shapes_spec(
+                x, source, leaf_spec, None, {}
+            )
+            fake_x = fake_mode.from_tensor(
+                x, static_shapes=False, source=source, symbolic_context=ctx
+            )
+            _wire_tensor_spec_dims(leaf_spec, fake_x)
+            return fake_x
+        # NB: don't match on bools.
+        if type(x) is int:
+            if isinstance(leaf_spec, int):
+                if x != leaf_spec:
+                    raise ValueError(
+                        f"shapes_spec declared {source.name} as static with "
+                        f"value {leaf_spec}, but got {x} at trace time"
+                    )
+                return x
+            if isinstance(leaf_spec, (IntVar, torch.SymInt)):
+                sym_node: torch.SymInt = shape_env.create_unbacked_symint(
+                    source=source
+                )
+                _wire_spec_slot(leaf_spec, sym_node)
+                return sym_node
+            if use_backed_for_ints:
+                return shape_env.create_symintnode(
+                    shape_env.create_symbol(x, source, positive=None),
+                    hint=x,
+                    source=source,
+                )
+            return x
+        if fakify_other is not None:
+            return fakify_other(x, source)
+        return x
+
+    with shape_env.ignore_fresh_unbacked_symbols():
+        fake_leaves = [
+            _fakify(x, leaf_sources[i], leaf_specs[i])
+            for i, x in enumerate(flat_args)
+        ]
+
+    _finalize_spec_wiring(shape_env)
+
+    return fake_leaves, flat_args, in_spec
