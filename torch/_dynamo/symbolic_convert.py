@@ -2511,22 +2511,28 @@ class InstructionTranslatorBase(
     def _attach_traceback_to_exception(self, exc: ExceptionVals) -> None:
         # based on CPython's PyTraceBack_Here impl
         frame_summary = self.frame_summary()
-        tb = exc.var_getattr(
-            # pyrefly: ignore [bad-argument-type]
-            self,
-            "__traceback__",
-        )
+        if isinstance(exc, (ExceptionVariable, UserDefinedExceptionObjectVariable)):
+            tb = exc.get_internal_traceback()
+        else:
+            tb = exc.var_getattr(
+                # pyrefly: ignore [bad-argument-type]
+                self,
+                "__traceback__",
+            )
         if not isinstance(tb, (ConstantVariable, TracebackVariable)):
             raise AssertionError(
                 "expected isinstance( tb, (ConstantVariable, TracebackVariable) ) to be true"
             )  # make pyrefly happy
         new_tb = TracebackVariable.from_frame_summary(frame_summary, tb)
-        exc.call_method(
-            self,  # type: ignore[bad-argument-type]
-            "__setattr__",
-            [VariableTracker.build(self, "__traceback__"), new_tb],
-            {},
-        )
+        if isinstance(exc, (ExceptionVariable, UserDefinedExceptionObjectVariable)):
+            exc.set_internal_traceback(new_tb)
+        else:
+            exc.call_method(
+                self,  # type: ignore[bad-argument-type]
+                "__setattr__",
+                [VariableTracker.build(self, "__traceback__"), new_tb],
+                {},
+            )
 
     def _raise_exception_variable(
         self, val: VariableTracker, set_context: bool
@@ -2693,11 +2699,14 @@ class InstructionTranslatorBase(
                     "expected self._isinstance_exception(val) to be true"
                 )
             typ = BuiltinVariable(val.exc_type)  # type: ignore[attr-defined, union-attr]
-            tb = val.var_getattr(
-                # pyrefly: ignore[bad-argument-type]
-                self,
-                "__traceback__",
-            )
+            if isinstance(val, (ExceptionVariable, UserDefinedExceptionObjectVariable)):
+                tb = val.get_internal_traceback()
+            else:
+                tb = val.var_getattr(
+                    # pyrefly: ignore[bad-argument-type]
+                    self,
+                    "__traceback__",
+                )
             if sys.version_info >= (3, 14):
                 if not isinstance(self.stack[-4], NullVariable):
                     args.append(self.stack[-4])
@@ -2712,7 +2721,10 @@ class InstructionTranslatorBase(
                 )
             typ = BuiltinVariable(val.exc_type)  # type: ignore[attr-defined]
 
-            tb = val.var_getattr(self, "__traceback__")
+            if isinstance(val, (ExceptionVariable, UserDefinedExceptionObjectVariable)):
+                tb = val.get_internal_traceback()
+            else:
+                tb = val.var_getattr(self, "__traceback__")
 
         args += [typ, val, tb]
         self.call_function(fn, args, {})
