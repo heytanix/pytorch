@@ -235,10 +235,38 @@ def hardswish_backward(grad_output: Tensor, self: Tensor) -> Tensor:
     )
 
 
-@register_decomposition(aten.threshold_backward)
+@register_decomposition(aten.threshold_backward.default)
 @out_wrapper("grad_input")
 def threshold_backward(grad_output: Tensor, self: Tensor, threshold: float):
-    return torch.where(self <= threshold, 0, grad_output)
+    _, result_dtype = utils.elementwise_dtypes(
+        self,
+        grad_output,
+        type_promotion_kind=utils.ELEMENTWISE_TYPE_PROMOTION_KIND.NO_OPMATH,
+    )
+    cmp = prims.convert_element_type(self, result_dtype)
+    cmp_dtype = result_dtype
+    if utils.is_float_dtype(result_dtype) and utils.is_low_precision_dtype(
+        result_dtype
+    ):
+        if self.device.type == "cuda":
+            # CUDA threshold kernels cast the scalar to the iterator dtype.
+            cmp_dtype = result_dtype
+        elif (
+            self.device.type == "mps"
+            and utils.is_float_dtype(self.dtype)
+            and utils.is_low_precision_dtype(self.dtype)
+        ):
+            # MPS threshold kernels cast the scalar to the input dtype.
+            cmp_dtype = self.dtype
+            cmp = self
+        else:
+            # CPU threshold kernels compare reduced floating inputs in fp32.
+            cmp_dtype = torch.float32
+            cmp = prims.convert_element_type(self, torch.float32)
+    cmp_threshold = torch.scalar_tensor(threshold, dtype=cmp_dtype, device=self.device)
+    zero = torch.scalar_tensor(0, dtype=result_dtype, device=grad_output.device)
+    grad_output = prims.convert_element_type(grad_output, result_dtype)
+    return torch.where(cmp <= cmp_threshold, zero, grad_output)
 
 
 @register_decomposition(aten.leaky_relu_backward)
