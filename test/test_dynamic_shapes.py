@@ -1655,6 +1655,25 @@ class f(torch.nn.Module):
                 f(torch.tensor([1]), torch.tensor([1])), torch.tensor([20])
             )
 
+    def test_unspecified_zero_one_symint_can_broadcast(self):
+        from torch._dynamo.source import ConstantSource
+        from torch._refs import _broadcast_shapes
+
+        shape_env = ShapeEnv()
+        s3 = shape_env.create_unspecified_symint_and_symbol(
+            3,
+            ConstantSource("s3"),
+            DimDynamic.DYNAMIC,
+        )
+        s1 = shape_env.create_unspecified_symint_and_symbol(
+            1,
+            ConstantSource("s1"),
+            DimDynamic.DYNAMIC,
+        )
+
+        self.assertNotIn(s1.node.expr, shape_env.do_not_specialize_zero_one_symbols)
+        self.assertEqual(_broadcast_shapes((s3,), (s1,)), [s3])
+
     @fresh_cache()
     def test_slice_backed_size_oblivious(self):
         @torch.compile(backend="inductor", fullgraph=True, dynamic=True)
