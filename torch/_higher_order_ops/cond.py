@@ -33,7 +33,10 @@ from torch._higher_order_ops.utils import (
 from torch._ops import HigherOrderOperator
 from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
 from torch.fx.experimental.proxy_tensor import ProxyTorchDispatchMode, track_tensor_tree
-from torch.utils._python_dispatch import _get_current_dispatch_mode
+from torch.utils._python_dispatch import (
+    _get_current_dispatch_mode,
+    _pop_mode_temporarily,
+)
 
 
 log = logging.getLogger(__name__)
@@ -235,6 +238,22 @@ def cond(
 
     if not torch._dynamo.is_dynamo_supported():
         raise RuntimeError("torch.cond requires dynamo support.")
+
+    mode = _get_current_dispatch_mode()
+    if mode is not None:
+        # HOP-aware modes can handle eager cond without Dynamo's wrapper compile.
+        result = NotImplemented
+        if type(mode) in cond_op.python_key_table:
+            handler = cond_op.python_key_table[type(mode)]
+            with _pop_mode_temporarily() as mode:
+                result = handler(mode, pred, true_fn, false_fn, operands)
+        elif mode.supports_higher_order_operators:
+            with _pop_mode_temporarily() as mode:
+                result = mode.__torch_dispatch__(
+                    cond_op, [], (pred, true_fn, false_fn, operands), {}
+                )
+        if result is not NotImplemented:
+            return result
 
     # Dynamo is expecting a callable with "__code__" attribute.
     # We cannot directly pass cond_op to it. So we wrap it in a dummy function.

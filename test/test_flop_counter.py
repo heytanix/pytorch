@@ -914,8 +914,8 @@ class TestFlopCounter(TestCase):
         self.assertExpectedInline(get_total_flops(mode), """9001""")
 
     def test_registered_hop(self):
-        from torch._ops import HigherOrderOperator
-        from torch.utils.flop_counter import register_flop_formula
+        from torch._ops import _higher_order_ops, HigherOrderOperator
+        from torch.utils.flop_counter import flop_registry, register_flop_formula
 
         class TestFlopCounterHOP(HigherOrderOperator):
             def __init__(self) -> None:
@@ -925,6 +925,8 @@ class TestFlopCounter(TestCase):
                 return super().__call__(x)
 
         hop = TestFlopCounterHOP()
+        self.addCleanup(_higher_order_ops.pop, hop.name(), None)
+        self.addCleanup(flop_registry.pop, hop, None)
 
         @hop.py_impl(torch._C.DispatchKey.CompositeExplicitAutograd)
         def hop_impl(x):

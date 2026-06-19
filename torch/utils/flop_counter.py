@@ -940,6 +940,7 @@ class _FlopCounterMode(TorchDispatchMode):
 
     @classmethod
     def ignore_compile_internals(cls) -> bool:
+        # flex_attention calls torch.compile internally before invoking its HOP.
         return True
 
     def __init__(self, counter: FlopCounterMode) -> None:
