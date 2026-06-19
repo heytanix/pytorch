@@ -956,7 +956,7 @@ class OutputGraph(OutputGraphCommon):
         with temporarely_allow_writes_to_output_graph(tx):
             # close() runs user code that may untrack, so iterate a snapshot
             for gen in list(self.local_generators):
-                if not gen._is_generator_exhausted():
+                if not gen._frame_state_finished():
                     # pyrefly: ignore[bad-argument-type]
                     gen.call_method(tx, "close", [], {})
 
