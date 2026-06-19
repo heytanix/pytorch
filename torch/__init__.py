@@ -2978,7 +2978,7 @@ def compile(
     | None = None,
     name: str | None = None,
     disable: builtins.bool = False,
-    shapes_spec: _Any = None,
+    dynamic_shapes: _Any = None,
 ) -> _Callable[_InputT, _RetT]: ...
 
 
@@ -2994,7 +2994,7 @@ def compile(
     | None = None,
     name: str | None = None,
     disable: builtins.bool = False,
-    shapes_spec: _Any = None,
+    dynamic_shapes: _Any = None,
 ) -> _Callable[[_Callable[_InputT, _RetT]], _Callable[_InputT, _RetT]]: ...
 
 
@@ -3011,7 +3011,7 @@ def compile(
     disable: builtins.bool = False,
     recompile_limit: builtins.int | None = None,
     isolate_recompiles: builtins.bool = False,
-    shapes_spec: _Any = None,
+    dynamic_shapes: _Any = None,
 ) -> (
     _Callable[[_Callable[_InputT, _RetT]], _Callable[_InputT, _RetT]]
     | _Callable[_InputT, _RetT]
@@ -3152,11 +3152,11 @@ def compile(
         backend = get_default_backend()
 
     # Auto-wrap ParamsSpec → ShapesSpec for convenience
-    if shapes_spec is not None:
+    if dynamic_shapes is not None:
         from torch.fx.experimental.dynamic_spec import ParamsSpec, ShapesSpec
 
-        if isinstance(shapes_spec, ParamsSpec):
-            shapes_spec = ShapesSpec(shapes_spec)
+        if isinstance(dynamic_shapes, ParamsSpec):
+            dynamic_shapes = ShapesSpec(dynamic_shapes)
 
     # Decorator mode
     if model is None:
@@ -3175,7 +3175,7 @@ def compile(
                 disable=disable,
                 recompile_limit=recompile_limit,
                 isolate_recompiles=isolate_recompiles,
-                shapes_spec=shapes_spec,
+                dynamic_shapes=dynamic_shapes,
             )
 
         return fn
@@ -3234,7 +3234,7 @@ def compile(
         guard_filter_fn=guard_filter_fn,
         recompile_limit=recompile_limit,
         isolate_recompiles=isolate_recompiles,
-        shapes_spec=shapes_spec,
+        dynamic_shapes=dynamic_shapes,
     )(model)  # type: ignore[return-value]
 
 
