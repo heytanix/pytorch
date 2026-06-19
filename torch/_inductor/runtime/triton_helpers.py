@@ -3,6 +3,8 @@
 import math as pymath
 import warnings
 from collections.abc import Callable
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Any, TypeVar
 
 from .triton_compat import (
@@ -18,6 +20,20 @@ from .triton_compat import (
 
 _T = TypeVar("_T")
 _LOG_2_E: tl.constexpr = tl.constexpr(pymath.log2(pymath.e))
+_skip_gpu_driver_setup: ContextVar[bool] = ContextVar(
+    "_skip_gpu_driver_setup", default=False
+)
+
+
+@contextmanager
+def skip_gpu_driver_setup():
+    # Scoped no-op for set_driver_to_gpu(). ContextVar keeps nested/thread-local
+    # uses isolated.
+    token = _skip_gpu_driver_setup.set(True)
+    try:
+        yield
+    finally:
+        _skip_gpu_driver_setup.reset(token)
 
 
 def set_driver_to_cpu():
@@ -52,6 +68,9 @@ def _is_backend_active(name, backend):
 
 
 def set_driver_to_gpu():
+    if _skip_gpu_driver_setup.get():
+        return
+
     driver = triton.runtime.driver
     for name, backend in triton.backends.backends.items():
         if _is_backend_active(name, backend) and name != "cpu":
@@ -347,6 +366,37 @@ def rand_eager_kernel(seed, offset_blocks, tid: tl.tensor, VEC: tl.constexpr):
     rand_int = tl.where((lane == 0) | (lane == 1), v01, v23)
 
     return 1.0 - (rand_int.to(tl.float32) * inv + half)
+
+
+@triton.jit
+def _random_4x_to_block(r0, r1, r2, r3):
+    # Pack lanes by logical offset so the random stream is independent of XBLOCK.
+    size: tl.constexpr = r0.numel
+    return tl.reshape(tl.join(tl.join(r0, r2), tl.join(r1, r3)), [size * 4])
+
+
+@triton.jit
+def rand4x(seed, offsets, BLOCK: tl.constexpr):
+    offsets = offsets.to(tl.uint32)
+    seed = tl.min(seed + offsets * 0, axis=0)
+    if BLOCK >= 4 and BLOCK % 4 == 0:
+        base = tl.min(offsets, axis=0)
+        reduced_offsets = base // 4 + tl.arange(0, BLOCK // 4)
+        r0, r1, r2, r3 = tl.rand4x(seed, reduced_offsets)
+        return _random_4x_to_block(r0, r1, r2, r3)
+    return tl.rand(seed, offsets)
+
+
+@triton.jit
+def randn4x(seed, offsets, BLOCK: tl.constexpr):
+    offsets = offsets.to(tl.uint32)
+    seed = tl.min(seed + offsets * 0, axis=0)
+    if BLOCK >= 4 and BLOCK % 4 == 0:
+        base = tl.min(offsets, axis=0)
+        reduced_offsets = base // 4 + tl.arange(0, BLOCK // 4)
+        r0, r1, r2, r3 = tl.randn4x(seed, reduced_offsets)
+        return _random_4x_to_block(r0, r1, r2, r3)
+    return tl.randn(seed, offsets)
 
 
 @triton.jit
@@ -853,7 +903,8 @@ def constexpr_next_power_of_2(
     """
     A version triton.next_power_of_two that can be used within a kernel on constants.
     """
-    assert isinstance(n, tl.constexpr)
+    if not isinstance(n, tl.constexpr):
+        raise AssertionError(f"Expected tl.constexpr, got {type(n)}")
     return tl.constexpr(triton.next_power_of_2(n.value))
 
 
