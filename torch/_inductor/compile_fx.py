@@ -402,14 +402,23 @@ def _resolve_name_collision(mod: GraphModule, gm: GraphModule) -> None:
 
 
 def _unlift_graph(
-    mod: GraphModule, gm: GraphModule, graph_signature: GraphSignature
+    mod: GraphModule,
+    gm: GraphModule,
+    graph_signature: GraphSignature,
+    named_parameters: list[tuple[str, torch.nn.Parameter]] | None = None,
+    named_buffers: list[tuple[str, torch.Tensor]] | None = None,
 ) -> GraphModule:
     from torch.export.unflatten import _assign_attr, _AttrKind
 
     _resolve_name_collision(mod, gm)
 
+    if named_parameters is None:
+        named_parameters = list(mod.named_parameters(remove_duplicate=False))
+    if named_buffers is None:
+        named_buffers = list(mod.named_buffers(remove_duplicate=False))
+
     state_dict: dict[str, torch.nn.parameter.Parameter | torch.Tensor] = {}
-    for name, param in mod.named_parameters(remove_duplicate=False):
+    for name, param in named_parameters:
         state_dict[name] = param
         _assign_attr(
             param,
@@ -417,7 +426,7 @@ def _unlift_graph(
             name,
             attr_kind=_AttrKind.PARAMETER,
         )
-    for name, buffer in mod.named_buffers(remove_duplicate=False):
+    for name, buffer in named_buffers:
         state_dict[name] = buffer
         _assign_attr(
             buffer,
@@ -3103,6 +3112,10 @@ def _compile_fx_main(
             # aot_export_module path doesn't use that cache so run them here.
             if isinstance(model_, GraphModule):
                 model_ = run_pre_grad_passes(model_, example_inputs_)
+            # aot_export_module functionalizes module attrs while tracing; keep
+            # the original Parameter/Buffer objects for AOTI unlift.
+            named_parameters = list(model_.named_parameters(remove_duplicate=False))
+            named_buffers = list(model_.named_buffers(remove_duplicate=False))
 
             with functorch_config.patch(
                 unlift_effect_tokens=True,
@@ -3149,7 +3162,9 @@ def _compile_fx_main(
                         elif isinstance(target, FakeScriptObject):
                             node.meta["val"] = target
 
-            unlifted_gm = _unlift_graph(model_, gm, graph_signature)
+            unlifted_gm = _unlift_graph(
+                model_, gm, graph_signature, named_parameters, named_buffers
+            )
             if "dynamo_flat_name_to_original_fqn" in model_.meta:
                 unlifted_gm.meta["dynamo_flat_name_to_original_fqn"] = model_.meta[
                     "dynamo_flat_name_to_original_fqn"
