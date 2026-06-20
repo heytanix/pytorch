@@ -41,7 +41,7 @@ Usage during capture::
 """
 
 import importlib.metadata
-import json
+import pickle
 from collections import defaultdict
 from contextlib import contextmanager
 from logging import getLogger
@@ -428,15 +428,13 @@ def get_kernel_annotations() -> dict[int, list[Any]]:
 
 
 def save_kernel_annotations(path: str | Path) -> None:
-    """Save the current kernel annotations to a JSON file.
+    """Save the current kernel annotations to a pickle file.
 
-    Keys are toolsId integers serialized as strings; values are lists of
-    annotation dicts.  The file can be passed directly to the Chrome trace
-    annotator (``torch.cuda._annotate_cuda_graph_trace``).
+    The file can be passed directly to the Chrome trace annotator
+    (``torch.cuda._annotate_cuda_graph_trace``).
     """
-    serializable = {str(k): v for k, v in _kernel_annotations.items()}
-    with open(path, "w") as f:
-        json.dump(serializable, f)
+    with open(path, "wb") as f:
+        pickle.dump(dict(_kernel_annotations), f)
 
 
 def clear_kernel_annotations() -> None:
@@ -501,7 +499,7 @@ def register_fqn_annotation_hooks(
         fqn = f"L.{name}" if name else "L"
 
         def pre_hook(mod: Any, _input: Any, fqn: str = fqn) -> None:
-            cm = mark_kernels(fqn)
+            cm = mark_kernels({"module_name": fqn})
             active_cms[id(mod)].append(cm)
             cm.__enter__()
 
