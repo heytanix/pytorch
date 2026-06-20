@@ -3430,6 +3430,8 @@ class BaseView(IRNode):
 
 @ir_dataclass
 class ExpandView(BaseView):
+    """View that expands singleton dimensions without materializing data."""
+
     size: Sequence[Expr]
 
     @staticmethod
@@ -3446,9 +3448,15 @@ class ExpandView(BaseView):
                 if old_size[i] is None:
                     raise AssertionError("Expected old_size[i] is not None")
                 new_size[i] = old_size[i]
-            elif old_size[i] is None or V.graph.sizevars.is_size_one_or_false(
-                old_size[i]
+            elif old_size[i] is not None and sizevars.statically_known_equals(
+                old_size[i], new_size[i]
             ):
+                pass
+            elif old_size[i] is None or sizevars.statically_known_equals(
+                old_size[i], 1
+            ):
+                pass
+            elif sizevars.is_size_one_or_false(old_size[i]):
                 pass
             elif not has_free_unbacked_symbols(
                 old_size
@@ -3490,7 +3498,7 @@ class ExpandView(BaseView):
             for stride, size in zip(old_layout.stride, old_layout.size):
                 new_stride.append(
                     stride
-                    if not V.graph.sizevars.is_size_one_or_false(size)
+                    if not V.graph.sizevars.statically_known_equals(size, 1)
                     else sympy.S.Zero
                 )
             new_layout = FixedLayout(
@@ -3522,7 +3530,12 @@ class ExpandView(BaseView):
             if len(index) != len(actual):
                 raise AssertionError("Expected len(index) == len(actual)")
             for i in range(len(actual)):
-                if actual[i] == 1:
+                target_dim = target[i + skip]
+                if V.graph.sizevars.statically_known_equals(actual[i], target_dim):
+                    continue
+                if V.graph.sizevars.statically_known_equals(
+                    actual[i], 1
+                ) or V.graph.sizevars.is_size_one_or_false(actual[i]):
                     # zero out broadcast dimension
                     index[i] = sympy.S.Zero
             return index

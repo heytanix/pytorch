@@ -571,7 +571,13 @@ def broadcast_symbolic_shapes(a, b):
 
     output = []
     for x, y in itertools.zip_longest(reversed(a), reversed(b), fillvalue=sympy.S.One):
-        if V.graph.sizevars.is_size_one_or_false(y):
+        if V.graph.sizevars.statically_known_equals(x, y):
+            output.append(x)
+        elif V.graph.sizevars.statically_known_equals(y, 1):
+            output.append(x)
+        elif V.graph.sizevars.statically_known_equals(x, 1):
+            output.append(y)
+        elif V.graph.sizevars.is_size_one_or_false(y):
             output.append(x)
         elif V.graph.sizevars.is_size_one_or_false(x):
             output.append(y)
@@ -1245,15 +1251,25 @@ def broadcast_tensors(*inputs):
     target: list[sympy.Expr] = functools.reduce(
         broadcast_symbolic_shapes, (x.get_size() for x in inputs), ()
     )
+
+    def needs_broadcast(a: sympy.Expr, b: sympy.Expr) -> bool:
+        if V.graph.sizevars.statically_known_equals(a, b):
+            return False
+        if V.graph.sizevars.statically_known_equals(
+            a, 1
+        ) or V.graph.sizevars.statically_known_equals(b, 1):
+            return True
+        return V.graph.sizevars.is_size_one_or_false(
+            a
+        ) != V.graph.sizevars.is_size_one_or_false(b)
+
     outputs = []
     for x in inputs:
         if (sizes := tuple(x.get_size())) == target:
             pass
 
         elif len(sizes) != len(target) or any(
-            V.graph.sizevars.is_size_one_or_false(a)
-            != V.graph.sizevars.is_size_one_or_false(b)
-            for a, b in zip(sizes, target)
+            needs_broadcast(a, b) for a, b in zip(sizes, target)
         ):
             x = expand(x, target)
         outputs.append(x)
